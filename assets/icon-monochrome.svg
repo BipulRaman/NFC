@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Android 13+ themed icon: single colour, chip and text lines cut out of the card. -->
+  <defs>
+    <mask id="cut">
+      <g transform="rotate(-12 220 280)">
+        <rect x="86" y="190" width="250" height="170" rx="26" fill="#FFFFFF"/>
+        <rect x="116" y="228" width="64" height="50" rx="11" fill="#000000"/>
+        <rect x="116" y="302" width="150" height="13" rx="6.5" fill="#000000"/>
+        <rect x="116" y="325" width="92" height="13" rx="6.5" fill="#000000"/>
+      </g>
+    </mask>
+  </defs>
+  <g transform="translate(256 256) scale(0.66) translate(-246 -265)" fill="#000000">
+    <rect x="0" y="0" width="512" height="512" mask="url(#cut)"/>
+    <g fill="none" stroke="#000000" stroke-linecap="round" stroke-width="22">
+      <path d="M351.7 203.7A44 44 0 0 1 351.7 260.3"/>
+      <path d="M380.8 179.3A82 82 0 0 1 380.8 284.7"/>
+      <path d="M409.9 154.8A120 120 0 0 1 409.9 309.2"/>
+    </g>
+  </g>
+</svg>

@@ -71,6 +71,10 @@ Unit tests (codec and encryption): `gradle testDebugUnitTest` in `app/android`.
    ```
 3. Open `app/android` in Android Studio (it generates the Gradle wrapper) and run on an NFC-capable phone.
 
+## App icon
+
+The icon's source is `assets/icon.svg` (plus `icon-foreground.svg` / `icon-monochrome.svg` for Android's adaptive and themed icons). After editing them, run `pwsh assets/render-icons.ps1` (needs `cargo install resvg`) to regenerate the desktop window icon and `.exe` icon (`app/desktop/assets`) and the Android launcher icons (`mipmap-*`).
+
 ## CI / Releases
 
 `.github/workflows/build.yml` builds and tests both apps on every push to `main`, pull request and manual run. These runs only build: nothing is packaged or published, and the token is read-only. When a GitHub release is **published**, it also attaches the binaries to that release: desktop archives for Windows x64, Linux x64 and macOS (arm64 and x64), plus a debug-signed Android APK.

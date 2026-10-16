@@ -22,3 +22,6 @@ desktop = ["dep:eframe", "dep:pcsc"]
 [dependencies]
 eframe = { version = "0.29", optional = true }
 pcsc = { version = "2", optional = true }
+
+[build-dependencies]
+winresource = "0.1"

@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
+  <title id="title">NFC Studio</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4A7BFF"/>
+      <stop offset="0.5" stop-color="#2856D8"/>
+      <stop offset="1" stop-color="#7A3FB0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.22" cy="0.12" r="0.9">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.38"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E3E9FF"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFE08A"/>
+      <stop offset="0.5" stop-color="#F6BD3B"/>
+      <stop offset="1" stop-color="#E39A16"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E9DDFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#0A1554" flood-opacity="0.38"/>
+    </filter>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0A1554" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Background tile -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#glow)"/>
+  <rect x="3" y="3" width="506" height="506" rx="113" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="6"/>
+
+  <g transform="translate(0 -14)">
+    <!-- Card -->
+    <g transform="rotate(-12 220 280)" filter="url(#shadow)">
+      <rect x="86" y="190" width="250" height="170" rx="26" fill="url(#card)"/>
+      <!-- Chip -->
+      <rect x="116" y="228" width="64" height="50" rx="11" fill="url(#chip)"/>
+      <clipPath id="chipClip"><rect x="116" y="228" width="64" height="50" rx="11"/></clipPath>
+      <g stroke="#C98612" stroke-width="3.5" stroke-linecap="round" fill="none" opacity="0.85" clip-path="url(#chipClip)">
+        <path d="M116 245h20m24 0h20M116 261h20m24 0h20"/>
+        <path d="M148 228v14m0 22v14"/>
+        <rect x="136" y="242" width="24" height="22" rx="5"/>
+      </g>
+      <!-- Text lines -->
+      <rect x="116" y="302" width="150" height="13" rx="6.5" fill="#C5CEF7"/>
+      <rect x="116" y="325" width="92" height="13" rx="6.5" fill="#D9DFFA"/>
+      <circle cx="298" cy="230" r="12" fill="#2856D8" opacity="0.18"/>
+      <circle cx="282" cy="230" r="12" fill="#7A3FB0" opacity="0.18"/>
+    </g>
+
+    <!-- Contactless waves -->
+    <g fill="none" stroke="url(#wave)" stroke-linecap="round" stroke-width="22" filter="url(#softShadow)">
+      <path d="M351.7 203.7A44 44 0 0 1 351.7 260.3"/>
+      <path d="M380.8 179.3A82 82 0 0 1 380.8 284.7" stroke-opacity="0.88"/>
+      <path d="M409.9 154.8A120 120 0 0 1 409.9 309.2" stroke-opacity="0.72"/>
+    </g>
+  </g>
+</svg>
