@@ -43,7 +43,8 @@ send APDUs to ISO-DEP cards (separate multiple commands with `;`).
 
 ## CI / Releases
 
-`.github/workflows/build.yml` builds and tests both apps on every push to `main`, pull request and manual run. When a GitHub release is **published**, it also attaches the binaries to that release: desktop archives for Windows x64, Linux x64 and macOS (arm64 and x64), plus a debug-signed Android APK.
+`.github/workflows/build.yml` builds and tests both apps on every push to `main`, pull request and manual run. These runs only build: nothing is packaged or published, and the token is read-only. When a GitHub release is **published**, it also attaches the binaries to that release: desktop archives for Windows x64, Linux x64 and macOS (arm64 and x64), plus a debug-signed Android APK.
+
+Android CI explicitly installs platform tools, SDK platform 34 and build tools 34.0.0 instead of the unavailable legacy `tools` package.
 
 Tag releases with a semantic version such as `1.0.0` (a leading `v`, as in `v1.0.0`, is also accepted). The tag version is stamped into the desktop crate and the APK (`versionName` = `1.0.0`, `versionCode` = `10000`), and the assets are named after it, for example `nfc-studio-1.0.0-windows-x64.zip`, `nfc-studio-1.0.0-linux-x64.tar.gz` and `nfc-studio-1.0.0-android.apk`. If the tag isn't in that format, the release build fails.
-
