@@ -1,0 +1,24 @@
+[package]
+name = "nfc-studio"
+version = "0.1.0"
+edition = "2024"
+description = "Read and write smart cards / NFC tags through PC/SC readers"
+
+[lib]
+name = "nfc_studio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nfc-studio"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+# PC/SC reader access + egui GUI. Disable (default-features = false) to use
+# only the portable APDU/NDEF core, e.g. from the Android JNI library.
+desktop = ["dep:eframe", "dep:pcsc"]
+
+[dependencies]
+eframe = { version = "0.29", optional = true }
+pcsc = { version = "2", optional = true }

@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">NFC Studio</string>
+    <string name="mode_read">Read</string>
+    <string name="mode_write_text">Write text</string>
+    <string name="mode_write_uri">Write URI</string>
+    <string name="mode_apdu">APDU</string>
+    <string name="input_hint">Text / URI / APDU hex (e.g. FF CA 00 00 00)</string>
+    <string name="tap_prompt">Tap a card on the back of the phone…</string>
+    <string name="clear_log">Clear log</string>
+    <string name="nfc_missing">This device has no NFC hardware.</string>
+    <string name="nfc_disabled">NFC is turned off. Enable it in Settings.</string>
+</resources>

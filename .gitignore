@@ -1,0 +1,16 @@
+# Rust
+target/
+
+# Android / Gradle
+.gradle/
+build/
+local.properties
+app/android/app/src/main/jniLibs/
+captures/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.vscode/

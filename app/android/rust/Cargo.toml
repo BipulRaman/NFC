@@ -1,0 +1,13 @@
+[package]
+name = "nfc-jni"
+version = "0.1.0"
+edition = "2024"
+description = "JNI bridge exposing the nfc-studio APDU/NDEF core to the Android app"
+
+[lib]
+name = "nfc_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+nfc-studio = { path = "../../desktop", default-features = false }
