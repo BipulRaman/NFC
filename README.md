@@ -42,8 +42,24 @@ cargo test
 
 ## Android app
 
-Features: read NDEF / MIFARE Ultralight / MIFARE Classic dumps, write Text or URI NDEF records,
-send APDUs to ISO-DEP cards (separate multiple commands with `;`).
+A Material 3 (Jetpack Compose) card wallet. Tap a card to see what's on it, edit it in the app, then
+tap **Save to card** and hold the card to the phone to write it.
+
+- **Store**: passwords (title, username, password with a generator, website, notes), notes, Wi-Fi
+  networks (other phones can join by tapping), websites, contacts, phone numbers and email addresses.
+- **Protect with a PIN**: passwords and notes can be encrypted on the card (PBKDF2-SHA256 →
+  AES-256-GCM). Only the title is visible without the PIN. Unlocked items are hidden again when the app
+  goes to the background, and screenshots are blocked while secrets are on screen.
+- **Manage**: add, edit, reorder and delete items (with undo); erase a card; copy everything to
+  another card; lock a card permanently. Blank cards are set up automatically on the first save, and
+  a size meter stops you from writing more than the card holds.
+- **Advanced tools**: raw memory dump and APDU commands for smart cards.
+
+Items use standard NDEF records where they exist (text, URI, `application/vnd.wfa.wsc`, `text/vcard`),
+so other phones understand them; passwords use `application/vnd.nfcstudio.password` and protected
+items `application/vnd.nfcstudio.locked`.
+
+Unit tests (codec and encryption): `gradle testDebugUnitTest` in `app/android`.
 
 1. Install Android Studio with SDK 34, the NDK, and JDK 17.
 2. Build the native library:
