@@ -12,8 +12,22 @@ app/
 
 ## Desktop app
 
-Features: list PC/SC readers, connect to card, show ATR/UID, send raw APDUs, read/write NDEF
-(Type 2 tags via PC/SC pseudo-APDUs), MIFARE Classic block read/write.
+Place a card on any connected reader and it's read automatically; no buttons needed. The main screen
+shows, in plain language:
+
+- **What the card is**: NFC tag (NTAG/Ultralight), MIFARE Classic card, or smart card, plus its card ID.
+- **On this card**: its contents as websites, text, phone numbers, email addresses, contacts or Wi-Fi
+  networks, with Open/Call/Copy buttons and a bar showing how much space is used.
+- **Write to card**: choose Text, Website, Phone or Email, type the value and press *Write to card*.
+  Input is checked and size-checked before writing, and replacing or erasing existing content asks
+  for confirmation. Blank MIFARE Classic 1K cards can be set up for messages with one click.
+
+Supported for reading and writing: NFC Forum Type 2 tags (NTAG21x, Ultralight), Type 4 tags (NDEF
+application, e.g. NTAG 424 / DESFire) and NFC-formatted MIFARE Classic. Bank, ID and other secure
+cards are identified but their protected data isn't shown.
+
+**Advanced tools** (top right) has the low-level views: raw APDU console, MIFARE Classic block
+read/write with custom keys, NTAG page read/write and a command log.
 
 Prerequisites:
 - Rust (stable, edition 2024)

@@ -134,6 +134,32 @@ pub fn is_sector_trailer(block: u8) -> bool {
     }
 }
 
+// --- ISO 7816-4 commands (sent to the card itself, used by NFC Forum Type 4 tags) ---
+
+pub fn select_aid(aid: &[u8]) -> Vec<u8> {
+    let mut a = vec![0x00, 0xA4, 0x04, 0x00, aid.len() as u8];
+    a.extend_from_slice(aid);
+    a.push(0x00);
+    a
+}
+
+pub fn select_file(fid: u16) -> Vec<u8> {
+    let [hi, lo] = fid.to_be_bytes();
+    vec![0x00, 0xA4, 0x00, 0x0C, 0x02, hi, lo]
+}
+
+pub fn iso_read_binary(offset: u16, len: u8) -> Vec<u8> {
+    let [hi, lo] = offset.to_be_bytes();
+    vec![0x00, 0xB0, hi, lo, len]
+}
+
+pub fn iso_update_binary(offset: u16, data: &[u8]) -> Vec<u8> {
+    let [hi, lo] = offset.to_be_bytes();
+    let mut a = vec![0x00, 0xD6, hi, lo, data.len() as u8];
+    a.extend_from_slice(data);
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

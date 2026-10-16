@@ -3,6 +3,7 @@
 
 pub mod apdu;
 pub mod ndef;
+pub mod tag;
 
 #[cfg(feature = "desktop")]
 pub mod card;

@@ -1,9 +1,13 @@
 //! Thin wrapper around PC/SC (WinSCard on Windows, pcsc-lite on Linux/macOS).
 
-use pcsc::{Attribute, Card, Context, Disposition, Protocols, Scope, ShareMode, MAX_BUFFER_SIZE};
+use pcsc::{
+    Attribute, Card, Context, Disposition, Protocols, ReaderState, Scope, ShareMode, State, MAX_BUFFER_SIZE,
+};
 use std::ffi::CString;
+use std::time::Duration;
 
 use crate::apdu;
+use crate::tag::Tech;
 
 pub struct Reader {
     ctx: Context,
@@ -44,6 +48,43 @@ impl CardKind {
             CardKind::Topaz => "Topaz / Jewel",
             CardKind::Felica => "FeliCa",
             CardKind::Iso14443_4 => "ISO 14443-4 (smart card / DESFire / EMV)",
+        }
+    }
+
+    /// A plain-language name for the card type.
+    pub fn friendly_name(self) -> &'static str {
+        match self {
+            CardKind::MifareClassic1K | CardKind::MifareClassic4K | CardKind::MifareMini => "MIFARE Classic card",
+            CardKind::Ultralight | CardKind::UltralightC => "NFC tag",
+            CardKind::Iso14443_4 => "Smart card",
+            CardKind::Topaz => "Topaz NFC tag",
+            CardKind::Felica => "FeliCa card",
+            CardKind::Unknown => "Smart card",
+        }
+    }
+
+    /// What this kind of card is commonly used for.
+    pub fn description(self) -> &'static str {
+        match self {
+            CardKind::MifareClassic1K | CardKind::MifareClassic4K | CardKind::MifareMini => {
+                "Common for access badges, hotel keys, transit and blank white cards."
+            }
+            CardKind::Ultralight | CardKind::UltralightC => "NTAG / Ultralight: used in stickers, key fobs, wristbands and smart posters.",
+            CardKind::Iso14443_4 => "Bank, ID, transit or high-security cards, or a phone acting as a tag.",
+            CardKind::Topaz | CardKind::Felica => "This card type can be identified but not read or written here.",
+            CardKind::Unknown => "A chip card such as a bank card, ID or employee badge, or an unrecognised tag.",
+        }
+    }
+
+    /// The technologies to try, in order, for reading this card's contents.
+    pub fn techs(self) -> Vec<Tech> {
+        match self {
+            CardKind::MifareClassic1K | CardKind::MifareClassic4K => vec![Tech::Classic { sectors: 16 }],
+            CardKind::MifareMini => vec![Tech::Classic { sectors: 5 }],
+            CardKind::Ultralight | CardKind::UltralightC => vec![Tech::Type2],
+            CardKind::Iso14443_4 => vec![Tech::Type4],
+            CardKind::Unknown => vec![Tech::Type2, Tech::Type4],
+            CardKind::Topaz | CardKind::Felica => Vec::new(),
         }
     }
 
@@ -93,6 +134,23 @@ impl Reader {
 
     pub fn is_connected(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Checks whether a card is on `reader` without connecting to it.
+    pub fn card_present(&self, reader: &str) -> Result<bool, String> {
+        let name = CString::new(reader).map_err(|e| e.to_string())?;
+        let mut states = [ReaderState::new(name, State::UNAWARE)];
+        match self.ctx.get_status_change(Duration::ZERO, &mut states) {
+            Ok(()) | Err(pcsc::Error::Timeout) => Ok(states[0].event_state().contains(State::PRESENT)),
+            Err(e) => Err(format!("Reader status: {e}")),
+        }
+    }
+
+    /// Resets the card's radio session, e.g. after a failed MIFARE Classic authentication.
+    pub fn reactivate(&mut self) -> Result<(), String> {
+        let card = self.card.as_mut().ok_or("Not connected to a card")?;
+        card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+            .map_err(|e| format!("Reactivate failed: {e}"))
     }
 
     pub fn connect(&mut self, reader: &str) -> Result<CardInfo, String> {
