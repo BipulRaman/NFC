@@ -69,7 +69,7 @@ fun HomeScreen(vm: AppViewModel, snackbar: SnackbarHostState) {
                     Text("Ready to scan", style = MaterialTheme.typography.headlineSmall)
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "Hold an NFC card, tag or sticker against the back of your phone to see what's on it.",
+                        "Hold an NFC or RFID card, tag or sticker against the back of your phone to see what's on it.",
                         style = MaterialTheme.typography.bodyLarge,
                         textAlign = TextAlign.Center,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -140,6 +140,17 @@ fun HomeScreen(vm: AppViewModel, snackbar: SnackbarHostState) {
                         Text(
                             "Passwords and notes can be locked with a PIN. They're encrypted on the card, " +
                                 "so anyone without the PIN only sees the title.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.Top) {
+                        Icon(Icons.Outlined.Nfc, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Works with 13.56 MHz NFC and RFID tags: NTAG, MIFARE, ICODE / ISO 15693 and FeliCa. " +
+                                "125 kHz access badges can't be read by phones; use NFC Studio for desktop with a " +
+                                "125 kHz USB reader.",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }

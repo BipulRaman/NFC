@@ -2,6 +2,7 @@
 //! PC/SC reader wrapper (desktop feature).
 
 pub mod apdu;
+pub mod badge;
 pub mod ndef;
 pub mod tag;
 

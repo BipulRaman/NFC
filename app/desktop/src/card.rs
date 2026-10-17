@@ -34,6 +34,10 @@ pub enum CardKind {
     Topaz,
     Felica,
     Iso14443_4,
+    /// ISO 15693 / NFC-V "vicinity" RFID tags such as NXP ICODE, TI Tag-it and ST LRI.
+    Iso15693,
+    /// HID iCLASS (PicoPass) access badges; data is encrypted.
+    IClass,
 }
 
 impl CardKind {
@@ -48,6 +52,8 @@ impl CardKind {
             CardKind::Topaz => "Topaz / Jewel",
             CardKind::Felica => "FeliCa",
             CardKind::Iso14443_4 => "ISO 14443-4 (smart card / DESFire / EMV)",
+            CardKind::Iso15693 => "ISO 15693 (NFC-V / ICODE / Tag-it)",
+            CardKind::IClass => "HID iCLASS",
         }
     }
 
@@ -59,6 +65,8 @@ impl CardKind {
             CardKind::Iso14443_4 => "Smart card",
             CardKind::Topaz => "Topaz NFC tag",
             CardKind::Felica => "FeliCa card",
+            CardKind::Iso15693 => "RFID tag",
+            CardKind::IClass => "HID iCLASS badge",
             CardKind::Unknown => "Smart card",
         }
     }
@@ -71,6 +79,10 @@ impl CardKind {
             }
             CardKind::Ultralight | CardKind::UltralightC => "NTAG / Ultralight: used in stickers, key fobs, wristbands and smart posters.",
             CardKind::Iso14443_4 => "Bank, ID, transit or high-security cards, or a phone acting as a tag.",
+            CardKind::Iso15693 => {
+                "ISO 15693 (NFC-V) RFID tag: used for library books, laundry, ski passes, inventory and asset labels."
+            }
+            CardKind::IClass => "An HID iCLASS access badge. Its data is encrypted, so only its ID can be shown.",
             CardKind::Topaz | CardKind::Felica => "This card type can be identified but not read or written here.",
             CardKind::Unknown => "A chip card such as a bank card, ID or employee badge, or an unrecognised tag.",
         }
@@ -83,8 +95,9 @@ impl CardKind {
             CardKind::MifareMini => vec![Tech::Classic { sectors: 5 }],
             CardKind::Ultralight | CardKind::UltralightC => vec![Tech::Type2],
             CardKind::Iso14443_4 => vec![Tech::Type4],
+            CardKind::Iso15693 => vec![Tech::Type5],
             CardKind::Unknown => vec![Tech::Type2, Tech::Type4],
-            CardKind::Topaz | CardKind::Felica => Vec::new(),
+            CardKind::Topaz | CardKind::Felica | CardKind::IClass => Vec::new(),
         }
     }
 
@@ -101,6 +114,7 @@ impl CardKind {
 pub fn detect_kind(atr: &[u8]) -> CardKind {
     const RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x06];
     if atr.len() >= 15 && atr[0] == 0x3B && atr[7..12] == RID {
+        // Byte 12 is the card standard (SS), bytes 13-14 the card name (NN).
         return match u16::from_be_bytes([atr[13], atr[14]]) {
             0x0001 => CardKind::MifareClassic1K,
             0x0002 => CardKind::MifareClassic4K,
@@ -109,13 +123,25 @@ pub fn detect_kind(atr: &[u8]) -> CardKind {
             0x003A => CardKind::UltralightC,
             0xF004 => CardKind::Topaz,
             0xF011 | 0xF012 => CardKind::Felica,
-            _ => CardKind::Unknown,
+            0x0017..=0x0020 => CardKind::IClass,
+            _ => match atr[12] {
+                0x09..=0x0C => CardKind::Iso15693,
+                0x11 => CardKind::Felica,
+                _ => CardKind::Unknown,
+            },
         };
     }
     if atr.len() >= 4 && atr[0] == 0x3B && atr[1] & 0xF0 == 0x80 {
         return CardKind::Iso14443_4;
     }
     CardKind::Unknown
+}
+
+/// TPM-backed virtual smart cards (e.g. Windows Hello for Business) always report a card but
+/// aren't physical readers.
+fn is_virtual_reader(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("windows hello") || lower.contains("virtual smart card")
 }
 
 impl Reader {
@@ -126,7 +152,11 @@ impl Reader {
 
     pub fn list_readers(&self) -> Result<Vec<String>, String> {
         match self.ctx.list_readers_owned() {
-            Ok(r) => Ok(r.into_iter().map(|c| c.to_string_lossy().into_owned()).collect()),
+            Ok(r) => Ok(r
+                .into_iter()
+                .map(|c| c.to_string_lossy().into_owned())
+                .filter(|name| !is_virtual_reader(name))
+                .collect()),
             Err(pcsc::Error::NoReadersAvailable) => Ok(Vec::new()),
             Err(e) => Err(format!("Failed to list readers: {e}")),
         }
@@ -204,5 +234,11 @@ mod tests {
         assert_eq!(detect_kind(&ntag), CardKind::Ultralight);
         let desfire = apdu::parse_hex("3B 81 80 01 80 80").unwrap();
         assert_eq!(detect_kind(&desfire), CardKind::Iso14443_4);
+        let icode = apdu::parse_hex("3B 8F 80 01 80 4F 0C A0 00 00 03 06 0B 00 14 00 00 00 00 77").unwrap();
+        assert_eq!(detect_kind(&icode), CardKind::Iso15693);
+        let tagit = apdu::parse_hex("3B 8F 80 01 80 4F 0C A0 00 00 03 06 0B 00 12 00 00 00 00 71").unwrap();
+        assert_eq!(detect_kind(&tagit), CardKind::Iso15693);
+        let iclass = apdu::parse_hex("3B 8F 80 01 80 4F 0C A0 00 00 03 06 0B 00 17 00 00 00 00 74").unwrap();
+        assert_eq!(detect_kind(&iclass), CardKind::IClass);
     }
 }

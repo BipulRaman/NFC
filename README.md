@@ -23,8 +23,15 @@ shows, in plain language:
   for confirmation. Blank MIFARE Classic 1K cards can be set up for messages with one click.
 
 Supported for reading and writing: NFC Forum Type 2 tags (NTAG21x, Ultralight), Type 4 tags (NDEF
-application, e.g. NTAG 424 / DESFire) and NFC-formatted MIFARE Classic. Bank, ID and other secure
-cards are identified but their protected data isn't shown.
+application, e.g. NTAG 424 / DESFire), NFC-formatted MIFARE Classic and **ISO 15693 / NFC-V RFID
+tags** (NXP ICODE SLIX, TI Tag-it, ST LRI; NFC Forum Type 5). Blank MIFARE Classic 1K cards and blank
+ISO 15693 tags can be set up with one click. ISO 15693 tags holding another system's data (e.g. library
+books) are left untouched. Bank, ID, HID iCLASS and other secure cards are identified but their
+protected data isn't shown. TPM virtual smart cards (Windows Hello) are hidden from the reader list.
+
+**125 kHz badges** tab: plug in a USB 125 kHz RFID reader (EM4100 / HID Prox / T5577 readers that type
+the card number like a keyboard) and scan badges. The app recognises the reader's fast typing, shows
+the number with its hex and 26-bit facility/card forms, and keeps a scan history you can copy.
 
 **Advanced tools** (top right) has the low-level views: raw APDU console, MIFARE Classic block
 read/write with custom keys, NTAG page read/write and a command log.
@@ -54,12 +61,16 @@ tap **Save to card** and hold the card to the phone to write it.
   another card; lock a card permanently. Blank cards are set up automatically on the first save, and
   a size meter stops you from writing more than the card holds.
 - **Advanced tools**: raw memory dump and APDU commands for smart cards.
+- **RFID**: works with 13.56 MHz NFC and RFID tags, including ISO 15693 / NFC-V tags (ICODE, Tag-it).
+  These are read, written and set up directly even on phones without built-in NDEF support for them;
+  tags holding another system's data are never overwritten. 125 kHz badges can't be read by phones;
+  use the desktop app with a 125 kHz USB reader.
 
 Items use standard NDEF records where they exist (text, URI, `application/vnd.wfa.wsc`, `text/vcard`),
 so other phones understand them; passwords use `application/vnd.nfcstudio.password` and protected
 items `application/vnd.nfcstudio.locked`.
 
-Unit tests (codec and encryption): `gradle testDebugUnitTest` in `app/android`.
+Unit tests (codec, encryption and ISO 15693): `gradle testDebugUnitTest` in `app/android`.
 
 1. Install Android Studio with SDK 34, the NDK, and JDK 17.
 2. Build the native library:

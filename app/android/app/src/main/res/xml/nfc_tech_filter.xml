@@ -1,10 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Opens the app for cards that can hold content; bank and ID cards are left alone. -->
+<!-- Opens the app for cards that can hold content, including ISO 15693 RFID tags; bank and ID cards are left alone. -->
 <resources>
     <tech-list>
         <tech>android.nfc.tech.Ndef</tech>
     </tech-list>
     <tech-list>
         <tech>android.nfc.tech.NdefFormatable</tech>
+    </tech-list>
+    <tech-list>
+        <tech>android.nfc.tech.NfcV</tech>
     </tech-list>
 </resources>

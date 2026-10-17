@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText};
 use nfc_studio::apdu::{self, KeyType};
+use nfc_studio::badge::{self, WedgeDecoder};
 use nfc_studio::card::{CardInfo, CardKind, Reader};
 use nfc_studio::ndef::{Record, RecordKind, WriteKind};
 use nfc_studio::tag::{self, ReadOutcome, TagContent, Transport};
@@ -115,6 +116,18 @@ enum Action {
     Format,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Cards,
+    Badges,
+}
+
+struct BadgeScan {
+    id: String,
+    at: Instant,
+    count: u32,
+}
+
 struct Notice {
     ok: bool,
     text: String,
@@ -135,6 +148,10 @@ struct App {
     write_text: String,
     notice: Option<Notice>,
     confirm: Option<Action>,
+
+    view: View,
+    wedge: WedgeDecoder,
+    badges: Vec<BadgeScan>,
 
     advanced: bool,
     tab: Tab,
@@ -164,6 +181,9 @@ impl App {
             write_text: String::new(),
             notice: None,
             confirm: None,
+            view: View::Cards,
+            wedge: WedgeDecoder::default(),
+            badges: Vec::new(),
             advanced: false,
             tab: Tab::Apdu,
             log: Vec::new(),
@@ -286,7 +306,7 @@ impl App {
         let mut result = Err(String::new());
         for tech in techs {
             result = tag::read(&mut link, tech);
-            if matches!(result, Ok(ReadOutcome::Ndef(_) | ReadOutcome::ClassicBlank)) {
+            if matches!(result, Ok(ReadOutcome::Ndef(_) | ReadOutcome::Blank(_))) {
                 break;
             }
         }
@@ -328,12 +348,155 @@ impl App {
     }
 
     fn format(&mut self) -> Result<(), String> {
-        let sectors = match self.info.as_ref().map(|i| i.kind) {
-            Some(CardKind::MifareClassic1K) => 16,
-            _ => return Err("Only MIFARE Classic 1K cards can be set up here.".into()),
+        let Some(Ok(ReadOutcome::Blank(tech))) = self.contents else {
+            return Err("Read the card first.".into());
         };
         let App { reader: Some(reader), log, .. } = self else { return Err("No reader".into()) };
-        tag::format_classic(&mut Link { reader, log }, sectors)
+        tag::format(&mut Link { reader, log }, tech)
+    }
+
+    // ---- 125 kHz badges --------------------------------------------------------
+
+    /// Watches keyboard input for card numbers typed by a USB badge reader.
+    fn capture_badges(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let now = Instant::now();
+        let events = ctx.input(|i| i.events.clone());
+        for event in events {
+            match event {
+                egui::Event::Text(text) => self.wedge.push(&text, now),
+                egui::Event::Key { key: egui::Key::Enter | egui::Key::Tab, pressed: true, .. } => {
+                    if let Some(id) = self.wedge.finish(now) {
+                        self.on_badge(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn on_badge(&mut self, id: String) {
+        self.log(format!("125 kHz badge: {id}"));
+        match self.badges.first_mut() {
+            // Readers repeat the number while the badge stays in the field.
+            Some(last) if last.id == id && last.at.elapsed() < Duration::from_secs(3) => {
+                last.count += 1;
+                last.at = Instant::now();
+            }
+            _ => {
+                self.badges.insert(0, BadgeScan { id, at: Instant::now(), count: 1 });
+                self.badges.truncate(100);
+            }
+        }
+        if !self.advanced {
+            self.view = View::Badges;
+        }
+    }
+
+    fn badges_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(16.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.notice_ui(ui);
+                    let latest = self.badges.first().map(|b| (b.id.clone(), b.at));
+                    section(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🏷").size(44.0));
+                            ui.vertical(|ui| match &latest {
+                                None => {
+                                    ui.label(RichText::new("Scan a 125 kHz badge").size(21.0).strong());
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(
+                                                "Plug in a USB 125 kHz RFID reader (EM4100 / HID Prox / T5577 badge \
+                                                 readers that type the card number) and hold a badge to it. Keep \
+                                                 this window in front while scanning.",
+                                            )
+                                            .weak(),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                Some((id, at)) => {
+                                    ui.label(RichText::new("Badge number").weak());
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(id).monospace().size(28.0).strong());
+                                        if ui.button("📋 Copy").clicked() {
+                                            ui.ctx().copy_text(id.clone());
+                                            self.notify(true, "Badge number copied.");
+                                        }
+                                    });
+                                    ui.weak(format!("Scanned {}", ago(*at)));
+                                }
+                            });
+                        });
+                        if let Some((id, _)) = &latest {
+                            let formats = badge::interpret(id);
+                            if !formats.is_empty() {
+                                ui.add_space(8.0);
+                                egui::Grid::new("badge_formats").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
+                                    for (label, value) in formats {
+                                        ui.weak(label);
+                                        ui.label(RichText::new(&value).monospace().size(16.0));
+                                        if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                                            ui.ctx().copy_text(value.clone());
+                                            self.notify(true, format!("{label} copied."));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    section(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🕘 Scan history").size(18.0).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add_enabled(!self.badges.is_empty(), egui::Button::new("🗑 Clear")).clicked() {
+                                    self.badges.clear();
+                                }
+                                if ui.add_enabled(!self.badges.is_empty(), egui::Button::new("📋 Copy list")).clicked() {
+                                    let list = self.badges.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join("\n");
+                                    ui.ctx().copy_text(list);
+                                    self.notify(true, "Scan history copied.");
+                                }
+                            });
+                        });
+                        if self.badges.is_empty() {
+                            ui.weak("Scanned badges appear here.");
+                        }
+                        let mut copied = None;
+                        for b in &self.badges {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&b.id).monospace());
+                                if b.count > 1 {
+                                    ui.weak(format!("×{}", b.count));
+                                }
+                                ui.weak(ago(b.at));
+                                if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                                    copied = Some(b.id.clone());
+                                }
+                            });
+                        }
+                        if let Some(id) = copied {
+                            ui.ctx().copy_text(id);
+                            self.notify(true, "Badge number copied.");
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.weak(
+                        "13.56 MHz NFC and RFID cards (MIFARE, NTAG, ICODE, …) are read on the Cards tab with a \
+                         PC/SC reader.",
+                    );
+                });
+            });
     }
 
     // ---- Simple view ---------------------------------------------------------
@@ -341,6 +504,12 @@ impl App {
     fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("📶 NFC Studio").size(22.0).strong());
+            ui.add_space(12.0);
+            if !self.advanced {
+                ui.selectable_value(&mut self.view, View::Cards, RichText::new("💳 NFC & RFID cards").size(15.0));
+                ui.selectable_value(&mut self.view, View::Badges, RichText::new("🏷 125 kHz badges").size(15.0))
+                    .on_hover_text("Badges read with a USB 125 kHz reader that types the card number");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.toggle_value(&mut self.advanced, "🛠 Advanced tools")
                     .on_hover_text("Low-level tools for raw commands, MIFARE blocks and NTAG pages");
@@ -402,9 +571,9 @@ impl App {
         let (icon, title, subtitle) = match (&reader_name, &self.info) {
             (None, _) => (
                 "🔌",
-                "Connect an NFC reader".to_string(),
-                "Plug a USB NFC or smart-card reader (for example an ACR122U) into this computer. \
-                 It will be detected automatically."
+                "Connect an NFC / RFID reader".to_string(),
+                "Plug a USB NFC or smart-card reader (for example an ACR122U or OMNIKEY) into this computer. \
+                 It will be detected automatically. Using a 125 kHz badge reader? Open the “125 kHz badges” tab."
                     .to_string(),
             ),
             (Some(_), None) if self.card_present => (
@@ -418,7 +587,7 @@ impl App {
             (Some(name), None) => (
                 "💳",
                 "Place a card on the reader".to_string(),
-                format!("Hold an NFC card, tag or sticker flat on “{name}”. It will be read automatically."),
+                format!("Hold an NFC or RFID card, tag or sticker flat on “{name}”. It will be read automatically."),
             ),
             (Some(_), Some(info)) => ("✅", info.kind.friendly_name().to_string(), info.kind.description().to_string()),
         };
@@ -452,7 +621,6 @@ impl App {
 
     fn contents_ui(&mut self, ui: &mut egui::Ui) {
         let contents = self.contents.clone();
-        let kind = self.info.as_ref().map(|i| i.kind);
         section(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -474,7 +642,7 @@ impl App {
                 Some(Ok(ReadOutcome::Unsupported(msg))) => {
                     ui.add(egui::Label::new(format!("ℹ {msg}")).wrap());
                 }
-                Some(Ok(ReadOutcome::ClassicBlank)) => {
+                Some(Ok(ReadOutcome::Blank(tech))) => {
                     ui.label(RichText::new("This card is blank.").size(16.0));
                     ui.add(
                         egui::Label::new(
@@ -484,7 +652,7 @@ impl App {
                         .wrap(),
                     );
                     ui.add_space(4.0);
-                    if kind == Some(CardKind::MifareClassic1K) {
+                    if tag::can_format(tech) {
                         if ui.add(primary("✨ Set up card")).clicked() {
                             self.confirm = Some(Action::Format);
                         }
@@ -561,7 +729,7 @@ impl App {
             ui.add_space(4.0);
             let Some(content) = self.ndef_content().cloned() else {
                 ui.weak(match &self.contents {
-                    Some(Ok(ReadOutcome::ClassicBlank)) => "Set up the card first, then you can write to it.",
+                    Some(Ok(ReadOutcome::Blank(_))) => "Set up the card first, then you can write to it.",
                     Some(Ok(ReadOutcome::Unsupported(_))) => "This card can't be written here.",
                     _ => "Once the card has been read, you can write to it here.",
                 });
@@ -992,6 +1160,7 @@ impl eframe::App for App {
         }
 
         let was_advanced = self.advanced;
+        self.capture_badges(ctx);
         egui::TopBottomPanel::top("header")
             .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(16.0, 10.0)))
             .show(ctx, |ui| self.header_ui(ui));
@@ -1002,9 +1171,20 @@ impl eframe::App for App {
 
         if self.advanced {
             self.advanced_ui(ctx);
+        } else if self.view == View::Badges {
+            self.badges_ui(ctx);
         } else {
             self.simple_ui(ctx);
             self.confirm_ui(ctx);
         }
+    }
+}
+
+fn ago(at: Instant) -> String {
+    match at.elapsed().as_secs() {
+        0..=4 => "just now".into(),
+        s @ 5..=59 => format!("{s} s ago"),
+        s @ 60..=3599 => format!("{} min ago", s / 60),
+        s => format!("{} h ago", s / 3600),
     }
 }

@@ -10,6 +10,7 @@ import android.nfc.tech.MifareClassic
 import android.nfc.tech.MifareUltralight
 import android.nfc.tech.Ndef
 import android.nfc.tech.NdefFormatable
+import android.nfc.tech.NfcV
 import dev.bipul.nfcstudio.NfcCore
 import dev.bipul.nfcstudio.data.RawRecord
 import java.io.IOException
@@ -67,6 +68,7 @@ object CardIo {
                 }
             }
         }
+        if (NfcV.get(tag) != null) return guard { readType5(tag, name, techs) }
         if (NdefFormatable.get(tag) != null) {
             return CardSnapshot(tag.id, name, techs, emptyList(), null, 0, true, false, true, null)
         }
@@ -83,6 +85,50 @@ object CardIo {
             else -> "This card type can't store content."
         }
         return CardSnapshot(tag.id, name, techs, emptyList(), null, 0, false, false, false, notice)
+    }
+
+    private const val FOREIGN_DATA = "This RFID tag holds data in another system's format (for example a library or " +
+        "inventory system), so it isn't shown or changed here. Advanced tools can show its raw memory."
+
+    /** Opens an ISO 15693 tag for raw Type 5 access. */
+    private inline fun <T> withType5(tag: Tag, block: (Type5Tag) -> T): T {
+        val nfcV = NfcV.get(tag) ?: throw CardException("This isn't an ISO 15693 tag.")
+        return nfcV.use {
+            it.connect()
+            val t = Type5Tag({ frame -> it.transceive(frame) }, tag.id)
+            t.open()
+            block(t)
+        }
+    }
+
+    /** Bytes left for the NDEF message once its TLV header is counted. */
+    private fun messageRoom(area: Int) = if (area - 2 < 0xFF) area - 2 else area - 4
+
+    private fun readType5(tag: Tag, name: String, techs: List<String>): CardSnapshot = withType5(tag) { t ->
+        when (val c = t.read()) {
+            is Type5Tag.Content.Ndef -> {
+                val (records, damaged) = if (c.message.isEmpty()) {
+                    emptyList<RawRecord>() to false
+                } else {
+                    try {
+                        NdefMessage(c.message).records.map(::toRaw) to false
+                    } catch (e: FormatException) {
+                        emptyList<RawRecord>() to true
+                    }
+                }
+                val content = records.filter { r -> r.tnf != RawRecord.TNF_EMPTY }
+                CardSnapshot(
+                    id = tag.id, typeName = name, techs = techs, records = content,
+                    capacity = messageRoom(c.capacity),
+                    used = if (content.isEmpty()) 0 else content.sumOf(RawRecord::byteSize),
+                    writable = c.writable, canMakeReadOnly = false, blank = false, notice = null, damaged = damaged,
+                )
+            }
+            is Type5Tag.Content.Blank ->
+                CardSnapshot(tag.id, name, techs, emptyList(), messageRoom(c.capacity), 0, true, false, true, null)
+            Type5Tag.Content.Foreign ->
+                CardSnapshot(tag.id, name, techs, emptyList(), null, 0, false, false, false, FOREIGN_DATA)
+        }
     }
 
     /** Replaces everything on the card with [records] (empty = erase). */
@@ -103,6 +149,10 @@ object CardIo {
                     }
                     it.writeNdefMessage(message)
                 }
+                return@guard
+            }
+            if (NfcV.get(tag) != null) {
+                withType5(tag) { it.write(message.toByteArray()) }
                 return@guard
             }
             NdefFormatable.get(tag)?.let { f ->
@@ -172,6 +222,10 @@ object CardIo {
             }
             return@guard out
         }
+        if (NfcV.get(tag) != null) {
+            out += withType5(tag) { t -> listOf("ISO 15693: ${t.blockCount} blocks of ${t.blockSize} bytes") + t.dump() }
+            return@guard out
+        }
         Ndef.get(tag)?.let { ndef ->
             ndef.use {
                 it.connect()
@@ -220,10 +274,10 @@ object CardIo {
             }
         }
         return when {
+            "NfcV" in techs -> "RFID tag (ISO 15693)"
             "MifareUltralight" in techs -> "NFC tag (NTAG / Ultralight)"
             "IsoDep" in techs && "Ndef" in techs -> "NFC Type 4 tag"
             "IsoDep" in techs -> "Smart card"
-            "NfcV" in techs -> "NFC-V tag (ISO 15693)"
             "NfcF" in techs -> "FeliCa card"
             else -> "NFC tag"
         }
@@ -240,6 +294,8 @@ object CardIo {
         throw e
     } catch (e: TagLostException) {
         throw CardException("The card moved away too soon. Hold it still against the phone and try again.")
+    } catch (e: Type5Exception) {
+        throw CardException(e.message ?: "The tag didn't respond as expected. Try again.")
     } catch (e: IOException) {
         throw CardException("Couldn't talk to the card. Hold it still against the phone and try again.")
     } catch (e: FormatException) {

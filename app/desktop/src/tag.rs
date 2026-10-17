@@ -27,6 +27,8 @@ pub enum Tech {
     Type4,
     /// MIFARE Classic with the given number of sectors (16 for 1K; only the first 16 are used).
     Classic { sectors: u8 },
+    /// NFC Forum Type 5: ISO 15693 / NFC-V RFID tags such as NXP ICODE SLIX.
+    Type5,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,8 +45,8 @@ pub struct TagContent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReadOutcome {
     Ndef(TagContent),
-    /// A MIFARE Classic card that still has factory keys and isn't set up for messages.
-    ClassicBlank,
+    /// A blank card that isn't set up for messages yet; [`format`] prepares it.
+    Blank(Tech),
     /// The card answered but its contents can't be shown; the text explains why.
     Unsupported(String),
 }
@@ -63,6 +65,7 @@ pub fn read(t: &mut impl Transport, tech: Tech) -> Result<ReadOutcome, String> {
         Tech::Type2 => read_type2(t),
         Tech::Type4 => read_type4(t),
         Tech::Classic { sectors } => read_classic(t, sectors),
+        Tech::Type5 => read_type5(t),
     }
 }
 
@@ -73,6 +76,21 @@ pub fn write(t: &mut impl Transport, tech: Tech, records: &[Record]) -> Result<(
         Tech::Type2 => write_type2(t, &msg),
         Tech::Type4 => write_type4(t, &msg),
         Tech::Classic { sectors } => write_classic(t, sectors, &msg),
+        Tech::Type5 => write_type5(t, &msg),
+    }
+}
+
+/// Whether a blank card of this technology can be set up here.
+pub fn can_format(tech: Tech) -> bool {
+    matches!(tech, Tech::Classic { sectors: 16 } | Tech::Type5)
+}
+
+/// Sets up a blank card to hold NFC messages.
+pub fn format(t: &mut impl Transport, tech: Tech) -> Result<(), String> {
+    match tech {
+        Tech::Classic { sectors } => format_classic(t, sectors),
+        Tech::Type5 => format_type5(t),
+        _ => Err("This card type can't be set up here.".into()),
     }
 }
 
@@ -267,6 +285,152 @@ fn write_type4(t: &mut impl Transport, msg: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+// ---- Type 5 (ISO 15693 / NFC-V) ------------------------------------------
+
+const FOREIGN_DATA: &str = "This RFID tag holds data in another system's format (for example a library or \
+     inventory system), so it isn't shown or changed here. Advanced tools can show its raw memory.";
+
+/// Reader access to an ISO 15693 tag's blocks through PC/SC READ/UPDATE BINARY.
+struct Type5Mem {
+    /// Le used for reads (4, or 0 for readers that want "whole block").
+    le: u8,
+    block: usize,
+    /// Memory read so far, starting at block 0.
+    mem: Vec<u8>,
+}
+
+impl Type5Mem {
+    fn open(t: &mut impl Transport) -> Result<Self, String> {
+        for le in [4u8, 0] {
+            if let Ok(d) = t.send_ok(&apdu::read_binary(0, le)) {
+                if matches!(d.len(), 4 | 8 | 16 | 32) {
+                    return Ok(Self { le, block: d.len(), mem: d });
+                }
+            }
+        }
+        Err("Couldn't read this RFID tag's memory with this reader.".into())
+    }
+
+    /// Reads the next block; `None` when the tag has no more blocks.
+    fn read_next(&mut self, t: &mut impl Transport) -> Result<Option<()>, String> {
+        let n = self.mem.len() / self.block;
+        let Ok(n) = u8::try_from(n) else { return Ok(None) };
+        match t.send_ok(&apdu::read_binary(n, self.le)) {
+            Ok(d) if d.len() == self.block => {
+                self.mem.extend(d);
+                Ok(Some(()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn ensure(&mut self, t: &mut impl Transport, len: usize) -> Result<bool, String> {
+        while self.mem.len() < len {
+            if self.read_next(t)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn write(&self, t: &mut impl Transport, first: usize, data: &[u8]) -> Result<(), String> {
+        for (i, chunk) in data.chunks(self.block).enumerate() {
+            let block = u8::try_from(first + i).map_err(|_| "The tag is too small for this.".to_string())?;
+            let mut buf = chunk.to_vec();
+            buf.resize(self.block, 0);
+            t.send_ok(&apdu::update_binary(block, &buf))
+                .map_err(|e| format!("Writing stopped part-way (block {block}): {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+struct Type5Cc {
+    len: usize,
+    capacity: usize,
+    writable: bool,
+}
+
+/// Parses the NFC Forum Type 5 capability container (4 or 8 bytes) at the start of memory.
+fn type5_cc(mem: &[u8]) -> Option<Type5Cc> {
+    if mem.len() < 4 || !matches!(mem[0], 0xE1 | 0xE2) {
+        return None;
+    }
+    let writable = mem[1] & 0x03 == 0;
+    if mem[2] != 0 {
+        return Some(Type5Cc { len: 4, capacity: (mem[2] as usize * 8).saturating_sub(4), writable });
+    }
+    if mem.len() < 8 {
+        return None;
+    }
+    let mlen = u16::from_be_bytes([mem[6], mem[7]]) as usize;
+    Some(Type5Cc { len: 8, capacity: (mlen * 8).saturating_sub(8), writable })
+}
+
+fn read_type5(t: &mut impl Transport) -> Result<ReadOutcome, String> {
+    let mut m = Type5Mem::open(t)?;
+    m.ensure(t, 8)?;
+    let Some(cc) = type5_cc(&m.mem) else {
+        return Ok(if m.mem.iter().all(|&b| b == 0) {
+            ReadOutcome::Blank(Tech::Type5)
+        } else {
+            ReadOutcome::Unsupported(FOREIGN_DATA.into())
+        });
+    };
+    loop {
+        if m.mem.len() > cc.len {
+            if let Some(out) = scan_memory(&m.mem[cc.len..], Tech::Type5, cc.capacity, cc.writable)? {
+                return Ok(out);
+            }
+        }
+        if m.read_next(t)?.is_none() {
+            // The tag ended before the message did.
+            let view = m.mem.get(cc.len..).unwrap_or_default();
+            return scan_memory(view, Tech::Type5, view.len(), cc.writable)?.ok_or_else(|| DAMAGED.into());
+        }
+    }
+}
+
+fn write_type5(t: &mut impl Transport, msg: &[u8]) -> Result<(), String> {
+    let mut m = Type5Mem::open(t)?;
+    m.ensure(t, 8)?;
+    let Some(cc) = type5_cc(&m.mem) else {
+        return Err("This tag isn't set up for NFC messages yet. Set it up first.".into());
+    };
+    if !cc.writable {
+        return Err("This tag is locked (read-only), so it can't be changed.".into());
+    }
+    let tlv = tlv_for(msg, cc.capacity, 1)?;
+    // The CC may share a block with the start of the message (8-byte blocks).
+    let first = cc.len / m.block;
+    let mut data = m.mem[first * m.block..cc.len].to_vec();
+    data.extend(tlv);
+    m.write(t, first, &data)
+}
+
+/// Sets up a blank ISO 15693 tag to hold NFC messages (NFC Forum Type 5 layout).
+pub fn format_type5(t: &mut impl Transport) -> Result<(), String> {
+    let mut m = Type5Mem::open(t)?;
+    while m.read_next(t)?.is_some() {}
+    if !m.mem.iter().all(|&b| b == 0) {
+        return Err("This tag already holds data, so it won't be overwritten.".into());
+    }
+    let total = m.mem.len();
+    if total < 16 {
+        return Err("This tag is too small to hold messages.".into());
+    }
+    let mlen = total / 8;
+    let mut data = match u8::try_from(mlen) {
+        Ok(n) => vec![0xE1, 0x40, n, 0x00],
+        Err(_) => {
+            let [hi, lo] = (mlen.min(0xFFFF) as u16).to_be_bytes();
+            vec![0xE2, 0x40, 0x00, 0x00, 0x00, 0x00, hi, lo]
+        }
+    };
+    data.extend([0x03, 0x00, 0xFE]);
+    m.write(t, 0, &data)
+}
+
 // ---- MIFARE Classic (NFC Forum MAD layout) --------------------------------
 
 fn classic_auth(t: &mut impl Transport, block: u8, key: &[u8; 6], kt: KeyType) -> Result<(), String> {
@@ -286,7 +450,7 @@ fn classic_capacity(sectors: u8) -> usize {
 fn read_classic(t: &mut impl Transport, sectors: u8) -> Result<ReadOutcome, String> {
     if classic_auth(t, 4, &NFC_KEY_A, KeyType::A).is_err() {
         return Ok(if classic_auth(t, 4, &FACTORY_KEY, KeyType::A).is_ok() {
-            ReadOutcome::ClassicBlank
+            ReadOutcome::Blank(Tech::Classic { sectors })
         } else {
             ReadOutcome::Unsupported(
                 "This MIFARE Classic card is protected with private keys (for example an office or \
@@ -502,6 +666,75 @@ mod tests {
         assert_eq!(read(&mut Bank, Tech::Type4).unwrap(), ReadOutcome::Unsupported(SECURE_CARD.into()));
     }
 
+    /// An ISO 15693 tag (e.g. ICODE SLIX: 28 blocks of 4 bytes) behind a PC/SC reader.
+    struct Vicinity {
+        block: usize,
+        mem: Vec<u8>,
+    }
+
+    impl Vicinity {
+        fn new(block: usize, blocks: usize) -> Self {
+            Self { block, mem: vec![0; block * blocks] }
+        }
+    }
+
+    impl Transport for Vicinity {
+        fn transmit(&mut self, c: &[u8]) -> Result<Vec<u8>, String> {
+            let start = c[3] as usize * self.block;
+            if start + self.block > self.mem.len() {
+                return Ok(vec![0x6A, 0x82]);
+            }
+            match c[1] {
+                0xB0 if c[4] as usize == self.block || c[4] == 0 => ok(self.mem[start..start + self.block].to_vec()),
+                0xB0 => Ok(vec![0x67, 0x00]),
+                0xD6 if c[4] as usize == self.block => {
+                    self.mem[start..start + self.block].copy_from_slice(&c[5..]);
+                    ok(vec![])
+                }
+                _ => Ok(FAIL.to_vec()),
+            }
+        }
+    }
+
+    #[test]
+    fn type5_blank_format_write_read_erase() {
+        for block in [4, 8] {
+            let mut tag = Vicinity::new(block, 112 / block);
+            assert_eq!(read(&mut tag, Tech::Type5).unwrap(), ReadOutcome::Blank(Tech::Type5));
+            assert!(can_format(Tech::Type5));
+            format(&mut tag, Tech::Type5).unwrap();
+            assert_eq!(tag.mem[..4], [0xE1, 0x40, 0x0E, 0x00]);
+            let ReadOutcome::Ndef(c) = read(&mut tag, Tech::Type5).unwrap() else { panic!() };
+            assert_eq!((c.records.len(), c.capacity, c.writable), (0, 108, true));
+
+            let recs = vec![text_record("Library book #4211", "en"), uri_record("https://example.com/b/4211")];
+            write(&mut tag, Tech::Type5, &recs).unwrap();
+            assert_eq!(tag.mem[..4], [0xE1, 0x40, 0x0E, 0x00], "CC preserved with {block}-byte blocks");
+            let ReadOutcome::Ndef(c) = read(&mut tag, Tech::Type5).unwrap() else { panic!() };
+            assert_eq!(c.records, recs);
+
+            write(&mut tag, Tech::Type5, &[]).unwrap();
+            let ReadOutcome::Ndef(c) = read(&mut tag, Tech::Type5).unwrap() else { panic!() };
+            assert!(c.records.is_empty());
+        }
+    }
+
+    #[test]
+    fn type5_protects_foreign_locked_and_oversized() {
+        let mut library = Vicinity::new(4, 28);
+        library.mem[..6].copy_from_slice(&[0x11, 0x01, 0x31, 0x32, 0x33, 0x34]);
+        assert!(matches!(read(&mut library, Tech::Type5).unwrap(), ReadOutcome::Unsupported(_)));
+        assert!(format(&mut library, Tech::Type5).unwrap_err().contains("already holds data"));
+        assert!(write(&mut library, Tech::Type5, &[text_record("x", "en")]).is_err());
+
+        let mut tag = Vicinity::new(4, 28);
+        format(&mut tag, Tech::Type5).unwrap();
+        let err = write(&mut tag, Tech::Type5, &[text_record(&"x".repeat(200), "en")]).unwrap_err();
+        assert!(err.contains("too much"), "{err}");
+        tag.mem[1] = 0x43;
+        assert!(write(&mut tag, Tech::Type5, &[text_record("x", "en")]).unwrap_err().contains("locked"));
+    }
+
     /// A MIFARE Classic 1K that enforces keys and, for non-factory sectors, key-B-only writes.
     struct Classic {
         blocks: Vec<[u8; 16]>,
@@ -582,7 +815,7 @@ mod tests {
     fn classic_blank_format_write_read() {
         let tech = Tech::Classic { sectors: 16 };
         let mut card = Classic::factory();
-        assert_eq!(read(&mut card, tech).unwrap(), ReadOutcome::ClassicBlank);
+        assert_eq!(read(&mut card, tech).unwrap(), ReadOutcome::Blank(tech));
 
         format_classic(&mut card, 16).unwrap();
         assert_eq!(card.blocks[1][..4], [0x14, 0x01, 0x03, 0xE1]);
