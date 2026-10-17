@@ -159,14 +159,32 @@ jobs:
           gradle-version: "8.7"
 
       - name: Build APK
+        if: github.event_name != 'release'
         working-directory: app/android
-        run: gradle --no-daemon assembleDebug $GRADLE_VERSION_ARGS
+        run: gradle --no-daemon assembleDebug
+
+      - name: Build signed release APK
+        if: github.event_name == 'release'
+        working-directory: app/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is missing; release APKs must be signed with the permanent key so updates install"
+            exit 1
+          fi
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$ANDROID_KEYSTORE_PATH"
+          gradle --no-daemon assembleRelease $GRADLE_VERSION_ARGS
+          rm -f "$ANDROID_KEYSTORE_PATH"
 
       - name: Package APK
         if: github.event_name == 'release'
         run: |
           mkdir -p out
-          cp app/android/app/build/outputs/apk/debug/app-debug.apk "out/nfc-studio-$VERSION-android.apk"
+          cp app/android/app/build/outputs/apk/release/app-release.apk "out/nfc-studio-$VERSION-android.apk"
 
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'release'

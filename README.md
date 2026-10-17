@@ -93,3 +93,5 @@ The icon's source is `assets/icon.svg` (plus `icon-foreground.svg` / `icon-monoc
 Android CI explicitly installs platform tools, SDK platform 34 and build tools 34.0.0 instead of the unavailable legacy `tools` package.
 
 Tag releases with a semantic version such as `1.0.0` (a leading `v`, as in `v1.0.0`, is also accepted). The tag version is stamped into the desktop crate and the APK (`versionName` = `1.0.0`, `versionCode` = `10000`), and the assets are named after it, for example `nfc-studio-1.0.0-windows-x64.zip`, `nfc-studio-1.0.0-linux-x64.tar.gz` and `nfc-studio-1.0.0-android.apk`. If the tag isn't in that format, the release build fails.
+
+Release APKs are signed with a permanent key so new versions install as updates over old ones (each release's `versionCode` is higher). The key lives in the repository secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_ALIAS`; a release build fails if they're missing. Keep a backup of the keystore: if it's lost, existing installs can't be updated. Builds that aren't releases are debug-signed for testing only.

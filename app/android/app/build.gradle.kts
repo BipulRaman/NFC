@@ -19,9 +19,23 @@ android {
         }
     }
 
+    signingConfigs {
+        // Release APKs must always be signed with the same key, or Android refuses to update the app.
+        // CI provides it from GitHub secrets; see .github/workflows/build.yml.
+        System.getenv("ANDROID_KEYSTORE_PATH")?.let { path ->
+            create("release") {
+                storeFile = file(path)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 
