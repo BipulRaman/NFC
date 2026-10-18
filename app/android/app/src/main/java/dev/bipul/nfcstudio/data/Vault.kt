@@ -5,9 +5,7 @@ import java.nio.ByteBuffer
 import java.security.SecureRandom
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
-import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
 class WrongPinException : Exception("Wrong PIN")
@@ -96,15 +94,8 @@ object Vault {
         return l.toByteArray(Charsets.UTF_8)
     }
 
-    private fun deriveKey(pin: String, salt: ByteArray, iterations: Int): SecretKeySpec {
-        val spec = PBEKeySpec(pin.toCharArray(), salt, iterations, 256)
-        try {
-            val key = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
-            return SecretKeySpec(key, "AES")
-        } finally {
-            spec.clearPassword()
-        }
-    }
+    private fun deriveKey(pin: String, salt: ByteArray, iterations: Int) =
+        SecretKeySpec(Pbkdf2.sha256(pin, salt, iterations, 32), "AES")
 
     /** A strong random password using letters, digits and symbols. */
     fun generatePassword(length: Int = 16, random: SecureRandom = SecureRandom()): String {

@@ -41,6 +41,7 @@ import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.PersonAdd
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.outlined.WarningAmber
@@ -85,7 +86,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.bipul.nfcstudio.data.CardItem
 import dev.bipul.nfcstudio.data.ItemKind
+import dev.bipul.nfcstudio.data.Seal
 import dev.bipul.nfcstudio.data.WifiSecurity
+import dev.bipul.nfcstudio.nfc.WriteProtection
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -103,6 +106,7 @@ fun CardScreen(
     var confirmLeave by remember { mutableStateOf(false) }
     var confirmErase by remember { mutableStateOf(false) }
     var confirmLock by remember { mutableStateOf(false) }
+    var showProtection by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val fabExpanded by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 } }
@@ -119,10 +123,16 @@ fun CardScreen(
                 },
                 title = { Text(if (card == null) "New card" else "Your card") },
                 actions = {
+                    if (card != null && card.supported) {
+                        IconButton(onClick = { showProtection = true }) { Icon(Icons.Outlined.Shield, "Protect card") }
+                    }
                     IconButton(onClick = { menu = true }) { Icon(Icons.Outlined.MoreVert, "More options") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         if (vm.draft.isNotEmpty()) {
                             MenuItem("Copy to another card", Icons.Outlined.CopyAll) { menu = false; vm.requestSave() }
+                        }
+                        if (card != null && card.supported) {
+                            MenuItem("Protect card", Icons.Outlined.Shield) { menu = false; showProtection = true }
                         }
                         if (card != null && card.supported && card.writable && !card.blank) {
                             MenuItem("Erase card", Icons.Outlined.DeleteSweep) { menu = false; confirmErase = true }
@@ -150,9 +160,10 @@ fun CardScreen(
                 SaveBar(
                     size = size,
                     capacity = capacity,
+                    sealed = vm.willSeal,
                     onAdd = onAdd.takeIf { vm.canEdit },
                     onDiscard = vm::discardChanges,
-                    onSave = vm::requestSave,
+                    onSave = { vm.requestSave() },
                 )
             }
         },
@@ -165,6 +176,9 @@ fun CardScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item(key = "header") { CardHeader(card, size, vm.draft.size) }
+            if (card != null && (card.seal != Seal.Status.None || card.protection?.status !in listOf(null, WriteProtection.Open))) {
+                item(key = "protection") { ProtectionBanners(card, vm.sealedByMe) }
+            }
             card?.notice?.let { notice ->
                 item(key = "notice") { Banner(Icons.Outlined.Info, notice) }
             }
@@ -226,8 +240,13 @@ fun CardScreen(
             dismissButton = { TextButton(onClick = { confirmErase = false }) { Text("Cancel") } },
         )
     }
+    if (showProtection) {
+        ProtectionSheet(vm, onDismiss = { showProtection = false }, onLock = { confirmLock = true })
+    }
     if (confirmLock) {
         var understood by rememberSaveable { mutableStateOf(false) }
+        var password by rememberSaveable { mutableStateOf("") }
+        val needsPassword = card?.needsPassword == true
         AlertDialog(
             onDismissRequest = { confirmLock = false },
             icon = { Icon(Icons.Outlined.Lock, null) },
@@ -235,6 +254,10 @@ fun CardScreen(
             text = {
                 Column {
                     Text("The card will become read-only forever. Nobody, including you, will ever be able to change or erase it.")
+                    if (needsPassword) {
+                        Spacer(Modifier.height(8.dp))
+                        PasswordField(password, { password = it }, "Current card password")
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = understood, onCheckedChange = { understood = it })
                         Text("I understand this can't be undone")
@@ -242,8 +265,13 @@ fun CardScreen(
                 }
             },
             confirmButton = {
-                TextButton(enabled = understood, onClick = { confirmLock = false; vm.requestMakeReadOnly() }) {
-                    Text("Lock forever", color = if (understood) MaterialTheme.colorScheme.error else Color.Unspecified)
+                val ready = understood && (!needsPassword || password.isNotEmpty())
+                TextButton(enabled = ready, onClick = {
+                    confirmLock = false
+                    if (needsPassword) vm.rememberCardPassword(password)
+                    vm.requestMakeReadOnly()
+                }) {
+                    Text("Lock forever", color = if (ready) MaterialTheme.colorScheme.error else Color.Unspecified)
                 }
             },
             dismissButton = { TextButton(onClick = { confirmLock = false }) { Text("Cancel") } },
@@ -290,18 +318,27 @@ private fun EmptyState(onAdd: () -> Unit) {
 }
 
 @Composable
-private fun SaveBar(size: Int, capacity: Int?, onAdd: (() -> Unit)?, onDiscard: () -> Unit, onSave: () -> Unit) {
+private fun SaveBar(
+    size: Int,
+    capacity: Int?,
+    sealed: Boolean,
+    onAdd: (() -> Unit)?,
+    onDiscard: () -> Unit,
+    onSave: () -> Unit,
+) {
     val tooBig = capacity != null && size > capacity
     Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Unsaved changes", style = MaterialTheme.typography.titleSmall)
+                    val seal = if (sealed) " · includes tamper seal" else ""
                     Text(
                         when {
-                            tooBig -> "Too big by ${size - capacity!!} bytes. Remove or shorten something."
-                            capacity != null -> "Uses $size of $capacity bytes"
-                            else -> "Uses $size bytes"
+                            tooBig -> "Too big by ${size - capacity!!} bytes. Remove or shorten something" +
+                                if (sealed) ", or turn off the seal." else "."
+                            capacity != null -> "Uses $size of $capacity bytes$seal"
+                            else -> "Uses $size bytes$seal"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = if (tooBig) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,

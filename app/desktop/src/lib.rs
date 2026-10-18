@@ -4,6 +4,8 @@
 pub mod apdu;
 pub mod badge;
 pub mod ndef;
+pub mod ntag;
+pub mod seal;
 pub mod tag;
 
 #[cfg(feature = "desktop")]

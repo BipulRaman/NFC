@@ -137,6 +137,37 @@ pub fn detect_kind(atr: &[u8]) -> CardKind {
     CardKind::Unknown
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RawMode {
+    Transparent,
+    Acr122,
+}
+
+/// Finds a BER-TLV value with a one-byte tag in a PC/SC transparent-session response.
+fn tlv_find(data: &[u8], tag: u8) -> Option<Vec<u8>> {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        let t = data[i];
+        let (len, hdr) = match data[i + 1] {
+            0x81 if i + 2 < data.len() => (data[i + 2] as usize, 3),
+            0x82 if i + 3 < data.len() => (u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize, 4),
+            n => (n as usize, 2),
+        };
+        let start = i + hdr;
+        let end = (start + len).min(data.len());
+        if t == tag {
+            return Some(data[start..end].to_vec());
+        }
+        i = end;
+    }
+    None
+}
+
+/// The generic status TLV (C0) reports success as `00 90 00`; it's absent on some readers.
+fn transparent_ok(body: &[u8]) -> bool {
+    tlv_find(body, 0xC0).is_none_or(|s| s.len() >= 3 && s[0] == 0x00 && s[1..3] == [0x90, 0x00])
+}
+
 /// TPM-backed virtual smart cards (e.g. Windows Hello for Business) always report a card but
 /// aren't physical readers.
 fn is_virtual_reader(name: &str) -> bool {
@@ -181,6 +212,60 @@ impl Reader {
         let card = self.card.as_mut().ok_or("Not connected to a card")?;
         card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
             .map_err(|e| format!("Reactivate failed: {e}"))
+    }
+
+    /// Opens a channel for raw card commands (needed for NTAG passwords), if the reader has one:
+    /// a PC/SC 2.01 transparent session, or the ACR122U's PN532 pass-through.
+    pub fn raw_begin(&mut self) -> Option<RawMode> {
+        if let Ok(r) = self.transmit(&[0xFF, 0xC2, 0x00, 0x00, 0x02, 0x81, 0x00, 0x00]) {
+            if r.ends_with(&[0x90, 0x00]) && transparent_ok(&r[..r.len() - 2]) {
+                return Some(RawMode::Transparent);
+            }
+        }
+        if let Ok(r) = self.transmit(&[0xFF, 0x00, 0x00, 0x00, 0x03, 0xD4, 0x42, 0x60]) {
+            if r.len() >= 5 && r[0] == 0xD5 && r[1] == 0x43 {
+                return Some(RawMode::Acr122);
+            }
+        }
+        None
+    }
+
+    pub fn raw_end(&mut self, mode: RawMode) {
+        if mode == RawMode::Transparent {
+            let _ = self.transmit(&[0xFF, 0xC2, 0x00, 0x00, 0x02, 0x82, 0x00, 0x00]);
+        }
+    }
+
+    /// Sends a raw frame (CRC added by the reader) and returns the card's answer.
+    pub fn raw(&mut self, mode: RawMode, frame: &[u8]) -> Result<Vec<u8>, String> {
+        let data = match mode {
+            RawMode::Transparent => {
+                let mut cmd = vec![0xFF, 0xC2, 0x00, 0x01, (frame.len() + 2) as u8, 0x95, frame.len() as u8];
+                cmd.extend_from_slice(frame);
+                cmd.push(0x00);
+                let r = self.transmit(&cmd)?;
+                let body = apdu::expect_ok(&r)?;
+                if !transparent_ok(&body) {
+                    return Err("No answer from the card".into());
+                }
+                tlv_find(&body, 0x97).unwrap_or_default()
+            }
+            RawMode::Acr122 => {
+                let mut cmd = vec![0xFF, 0x00, 0x00, 0x00, (frame.len() + 2) as u8, 0xD4, 0x42];
+                cmd.extend_from_slice(frame);
+                let r = self.transmit(&cmd)?;
+                let body = apdu::expect_ok(&r)?;
+                if body.len() < 3 || body[..2] != [0xD5, 0x43] || body[2] != 0x00 {
+                    return Err("No answer from the card".into());
+                }
+                body[3..].to_vec()
+            }
+        };
+        // WRITE and PWD_AUTH answer with a 4-bit ACK (0xA); anything else is a NAK.
+        if matches!(frame.first(), Some(0xA2 | 0x1B)) && data.len() == 1 && data[0] & 0x0F != 0x0A {
+            return Err("The card refused the command".into());
+        }
+        Ok(data)
     }
 
     pub fn connect(&mut self, reader: &str) -> Result<CardInfo, String> {
@@ -240,5 +325,14 @@ mod tests {
         assert_eq!(detect_kind(&tagit), CardKind::Iso15693);
         let iclass = apdu::parse_hex("3B 8F 80 01 80 4F 0C A0 00 00 03 06 0B 00 17 00 00 00 00 74").unwrap();
         assert_eq!(detect_kind(&iclass), CardKind::IClass);
+    }
+
+    #[test]
+    fn parses_transparent_session_responses() {
+        let body = apdu::parse_hex("C0 03 00 90 00 92 01 00 96 02 00 00 97 02 AB CD").unwrap();
+        assert!(transparent_ok(&body));
+        assert_eq!(tlv_find(&body, 0x97), Some(vec![0xAB, 0xCD]));
+        assert!(!transparent_ok(&apdu::parse_hex("C0 03 01 64 01").unwrap()));
+        assert!(transparent_ok(&[]));
     }
 }

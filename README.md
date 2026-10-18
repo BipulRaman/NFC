@@ -82,6 +82,25 @@ Unit tests (codec, encryption and ISO 15693): `gradle testDebugUnitTest` in `app
    ```
 3. Open `app/android` in Android Studio (it generates the Gradle wrapper) and run on an NFC-capable phone.
 
+## Tamper protection (both apps)
+
+- **Tamper seal**: when saving, both apps add a digital signature (ECDSA P-256) over the content and the
+  card's unique ID as an extra NDEF record (`nfcstudio.dev:seal`). Reading a sealed card shows
+  **Sealed by you**, **Sealed by another device** (with the key's fingerprint) or **Seal broken** if
+  the content was changed or copied to another card. Works on every writable card type; it adds 119 bytes.
+  Each phone keeps its key in the Android Keystore; the desktop keeps it in `%APPDATA%\NFC Studio\seal-key`
+  (`~/.config/nfc-studio/seal-key` elsewhere).
+- **Write password** (NTAG213/215/216, MIFARE Ultralight EV1): the chip's own password protection. Anyone
+  can still read the card, but changes need the password. The password is turned into the chip's 32-bit
+  PWD/PACK with PBKDF2 and the card ID, and the card can freeze itself after 7 wrong attempts to stop
+  guessing. Passwords are only kept in memory for the session.
+- **Lock permanently**: makes the card read-only forever (static lock bits, read-only flag, and a random
+  unknown password with a one-attempt limit for the rest of the memory).
+
+Write protection stops changes, not reading; keep secrets in PIN-protected items. On the desktop, the
+password and lock need a reader that can send raw tag commands (PC/SC transparent session, e.g. OMNIKEY
+5022 or ACR1252U, or an ACR122U); the seal works with any reader.
+
 ## App icon
 
 The icon's source is `assets/icon.svg` (plus `icon-foreground.svg` / `icon-monochrome.svg` for Android's adaptive and themed icons). After editing them, run `pwsh assets/render-icons.ps1` (needs `cargo install resvg`) to regenerate the desktop window icon and `.exe` icon (`app/desktop/assets`) and the Android launcher icons (`mipmap-*`).

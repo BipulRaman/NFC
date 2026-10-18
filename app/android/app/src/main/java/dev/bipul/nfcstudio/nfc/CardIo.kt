@@ -13,13 +13,18 @@ import android.nfc.tech.NdefFormatable
 import android.nfc.tech.NfcV
 import dev.bipul.nfcstudio.NfcCore
 import dev.bipul.nfcstudio.data.RawRecord
+import dev.bipul.nfcstudio.data.Seal
 import java.io.IOException
+
+/** Hardware write protection of an NTAG / Ultralight card; [model] is null when passwords aren't supported. */
+data class Protection(val model: NtagModel?, val status: WriteProtection)
 
 /** What we learned from one tap. */
 data class CardSnapshot(
     val id: ByteArray,
     val typeName: String,
     val techs: List<String>,
+    /** The card's content, without the tamper seal. */
     val records: List<RawRecord>,
     /** Bytes available for content, or null when unknown (blank cards). */
     val capacity: Int?,
@@ -32,9 +37,12 @@ data class CardSnapshot(
     val notice: String?,
     /** The stored data couldn't be parsed; saving or erasing fixes it. */
     val damaged: Boolean = false,
+    val seal: Seal.Status = Seal.Status.None,
+    val protection: Protection? = null,
 ) {
     val supported get() = notice == null
     val idHex: String get() = id.joinToString(":") { "%02X".format(it) }
+    val needsPassword get() = protection?.status is WriteProtection.Password
 }
 
 class CardException(message: String) : Exception(message)
@@ -42,6 +50,28 @@ class CardException(message: String) : Exception(message)
 object CardIo {
 
     fun read(tag: Tag): CardSnapshot {
+        val snap = readContent(tag)
+        val (seal, content) = Seal.verify(tag.id, snap.records)
+        var result = snap.copy(records = content, seal = seal)
+        if (MifareUltralight.get(tag) != null && snap.supported) {
+            val protection = runCatching {
+                withType2(tag) { t ->
+                    val model = t.identify()
+                    val fallback = if (snap.writable) WriteProtection.Open else WriteProtection.Locked
+                    Protection(model, model?.let { m -> runCatching { t.status(m) }.getOrNull() } ?: fallback)
+                }
+            }.getOrNull()
+            result = result.copy(
+                protection = protection,
+                // Our permanent lock works on password-protected tags too.
+                canMakeReadOnly = result.canMakeReadOnly ||
+                    (protection?.model != null && protection.status != WriteProtection.Locked),
+            )
+        }
+        return result
+    }
+
+    private fun readContent(tag: Tag): CardSnapshot {
         val techs = tag.techList.map { it.substringAfterLast('.') }
         val name = describe(tag)
         Ndef.get(tag)?.let { ndef ->
@@ -131,43 +161,122 @@ object CardIo {
         }
     }
 
-    /** Replaces everything on the card with [records] (empty = erase). */
-    fun write(tag: Tag, records: List<RawRecord>) {
-        val message = if (records.isEmpty()) {
-            NdefMessage(NdefRecord(NdefRecord.TNF_EMPTY, null, null, null))
-        } else {
-            NdefMessage(records.map(::toNdef).toTypedArray())
-        }
-        guard {
-            Ndef.get(tag)?.let { ndef ->
-                ndef.use {
-                    it.connect()
-                    if (!it.isWritable) throw CardException("This card is locked (read-only), so it can't be changed.")
-                    val size = message.byteArrayLength
-                    if (size > it.maxSize) {
-                        throw CardException("That's too much for this card: it needs $size bytes but holds ${it.maxSize}.")
+    /** Opens an NTAG / Ultralight tag for raw Type 2 commands. */
+    private inline fun <T> withType2(tag: Tag, block: (Type2Tag) -> T): T {
+        val ul = MifareUltralight.get(tag) ?: throw CardException("This card doesn't support write protection.")
+        return ul.use {
+            it.connect()
+            val io = Transceiver { frame ->
+                when (frame[0].toInt() and 0xFF) {
+                    // NAKs arrive as exceptions on Android; report them as a 1-byte NAK instead.
+                    0xA2 -> try {
+                        it.writePage(frame[1].toInt() and 0xFF, frame.copyOfRange(2, 6))
+                        byteArrayOf(0x0A)
+                    } catch (e: TagLostException) {
+                        throw e
+                    } catch (e: IOException) {
+                        byteArrayOf(0x00)
                     }
-                    it.writeNdefMessage(message)
+                    0x1B -> try {
+                        it.transceive(frame)
+                    } catch (e: TagLostException) {
+                        throw e
+                    } catch (e: IOException) {
+                        byteArrayOf(0x00)
+                    }
+                    else -> it.transceive(frame)
                 }
-                return@guard
             }
-            if (NfcV.get(tag) != null) {
-                withType5(tag) { it.write(message.toByteArray()) }
-                return@guard
-            }
-            NdefFormatable.get(tag)?.let { f ->
-                f.use {
-                    it.connect()
-                    it.format(message)
-                }
-                return@guard
-            }
-            throw CardException("This card can't store content.")
+            block(Type2Tag(io, tag.id))
         }
     }
 
-    fun makeReadOnly(tag: Tag) {
+    /** Replaces everything on the card with [records] (empty = erase), adding a tamper seal if [signer] is set. */
+    fun write(tag: Tag, records: List<RawRecord>, password: String? = null, signer: Seal.Signer? = null) {
+        val all = if (signer != null && records.isNotEmpty() && Seal.uidIsStable(tag.id)) {
+            records + Seal.sealRecord(signer, tag.id, records)
+        } else {
+            records
+        }
         guard {
+            if (MifareUltralight.get(tag) != null) {
+                val done = withType2(tag) { t ->
+                    val model = t.identify() ?: return@withType2 false
+                    when (t.status(model)) {
+                        WriteProtection.Locked -> throw CardException("This card is locked permanently, so it can't be changed.")
+                        is WriteProtection.Password -> {
+                            t.authenticate(password ?: throw NeedsPasswordException())
+                            t.writeNdef(messageFor(all).toByteArray())
+                            true
+                        }
+                        WriteProtection.Open -> false
+                    }
+                }
+                if (done) return@guard
+            }
+            writeOpen(tag, all)
+        }
+    }
+
+    fun setPassword(tag: Tag, newPassword: String, limitAttempts: Boolean, current: String?) = guard {
+        withType2(tag) { t ->
+            val model = t.identify() ?: throw CardException("This tag type doesn't support a password.")
+            t.setPassword(model, newPassword, limitAttempts, current)
+        }
+    }
+
+    fun removePassword(tag: Tag, current: String) = guard {
+        withType2(tag) { t ->
+            val model = t.identify() ?: throw CardException("This tag type doesn't support a password.")
+            t.removePassword(model, current)
+        }
+    }
+
+    private fun messageFor(records: List<RawRecord>) = if (records.isEmpty()) {
+        NdefMessage(NdefRecord(NdefRecord.TNF_EMPTY, null, null, null))
+    } else {
+        NdefMessage(records.map(::toNdef).toTypedArray())
+    }
+
+    private fun writeOpen(tag: Tag, records: List<RawRecord>) {
+        val message = messageFor(records)
+        Ndef.get(tag)?.let { ndef ->
+            ndef.use {
+                it.connect()
+                if (!it.isWritable) throw CardException("This card is locked (read-only), so it can't be changed.")
+                val size = message.byteArrayLength
+                if (size > it.maxSize) {
+                    throw CardException("That's too much for this card: it needs $size bytes but holds ${it.maxSize}.")
+                }
+                it.writeNdefMessage(message)
+            }
+            return
+        }
+        if (NfcV.get(tag) != null) {
+            withType5(tag) { it.write(message.toByteArray()) }
+            return
+        }
+        NdefFormatable.get(tag)?.let { f ->
+            f.use {
+                it.connect()
+                it.format(message)
+            }
+            return
+        }
+        throw CardException("This card can't store content.")
+    }
+
+    /** Makes the card read-only forever. [current] is the write password, if the card has one. */
+    fun makeReadOnly(tag: Tag, current: String? = null) {
+        guard {
+            if (MifareUltralight.get(tag) != null) {
+                val done = withType2(tag) { t ->
+                    val model = t.identify() ?: return@withType2 false
+                    t.lockForever(model, current)
+                    true
+                }
+                if (done) return@guard
+            }
             val ndef = Ndef.get(tag) ?: throw CardException("This card can't be locked.")
             ndef.use {
                 it.connect()
@@ -292,8 +401,14 @@ object CardIo {
         block()
     } catch (e: CardException) {
         throw e
+    } catch (e: NeedsPasswordException) {
+        throw e
+    } catch (e: WrongPasswordException) {
+        throw e
     } catch (e: TagLostException) {
         throw CardException("The card moved away too soon. Hold it still against the phone and try again.")
+    } catch (e: Type2Exception) {
+        throw CardException(e.message ?: "The tag didn't respond as expected. Try again.")
     } catch (e: Type5Exception) {
         throw CardException(e.message ?: "The tag didn't respond as expected. Try again.")
     } catch (e: IOException) {

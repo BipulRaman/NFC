@@ -108,15 +108,32 @@ fun TapSheet(vm: AppViewModel) {
                         }
                         is TapSheet.Failed -> {
                             Spacer(Modifier.height(24.dp))
-                            Icon(Icons.Outlined.ErrorOutline, null, Modifier.size(88.dp), tint = MaterialTheme.colorScheme.error)
+                            Icon(
+                                if (s.askPassword) Icons.Outlined.Lock else Icons.Outlined.ErrorOutline,
+                                null,
+                                Modifier.size(88.dp),
+                                tint = if (s.askPassword) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                            )
                             Spacer(Modifier.height(16.dp))
-                            Text("That didn't work", style = MaterialTheme.typography.titleLarge)
+                            Text(if (s.askPassword) "Card password needed" else "That didn't work", style = MaterialTheme.typography.titleLarge)
                             Spacer(Modifier.height(6.dp))
                             Text(s.message, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(20.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                OutlinedButton(onClick = vm::cancelTap) { Text("Cancel") }
-                                Button(onClick = vm::retry) { Text("Try again") }
+                            if (s.askPassword) {
+                                var password by rememberSaveable { mutableStateOf("") }
+                                PasswordField(password, { password = it }, "Card password")
+                                Spacer(Modifier.height(16.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    OutlinedButton(onClick = vm::cancelTap) { Text("Cancel") }
+                                    Button(onClick = { vm.retryWithPassword(password) }, enabled = password.isNotEmpty()) {
+                                        Text("Continue")
+                                    }
+                                }
+                            } else {
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    OutlinedButton(onClick = vm::cancelTap) { Text("Cancel") }
+                                    Button(onClick = vm::retry) { Text("Try again") }
+                                }
                             }
                         }
                     }
@@ -130,6 +147,8 @@ private fun waitingTitle(p: Pending) = when (p) {
     is Pending.Save -> "Hold the card you want to save to"
     Pending.Erase -> "Hold the card to erase"
     Pending.MakeReadOnly -> "Hold the card to lock it"
+    is Pending.SetPassword -> "Hold the card to set its password"
+    Pending.RemovePassword -> "Hold the card to remove its password"
     Pending.Dump -> "Hold the card to read its memory"
     is Pending.Apdu -> "Hold the smart card"
 }

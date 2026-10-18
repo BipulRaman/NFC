@@ -35,6 +35,8 @@ pub enum Tech {
 pub struct TagContent {
     pub tech: Tech,
     pub records: Vec<Record>,
+    /// The stored NDEF message exactly as read (empty when there's none).
+    pub message: Vec<u8>,
     /// Bytes currently used by the stored message.
     pub used: usize,
     /// Bytes available for messages.
@@ -71,12 +73,24 @@ pub fn read(t: &mut impl Transport, tech: Tech) -> Result<ReadOutcome, String> {
 
 /// Replaces the card's contents with `records`; an empty slice erases the card.
 pub fn write(t: &mut impl Transport, tech: Tech, records: &[Record]) -> Result<(), String> {
-    let msg = ndef::encode_message(records);
+    write_message(t, tech, &ndef::encode_message(records))
+}
+
+/// Replaces the card's contents with an already encoded NDEF message.
+pub fn write_message(t: &mut impl Transport, tech: Tech, msg: &[u8]) -> Result<(), String> {
     match tech {
-        Tech::Type2 => write_type2(t, &msg),
-        Tech::Type4 => write_type4(t, &msg),
-        Tech::Classic { sectors } => write_classic(t, sectors, &msg),
-        Tech::Type5 => write_type5(t, &msg),
+        Tech::Type2 => write_type2(t, msg),
+        Tech::Type4 => write_type4(t, msg),
+        Tech::Classic { sectors } => write_classic(t, sectors, msg),
+        Tech::Type5 => write_type5(t, msg),
+    }
+}
+
+/// Bytes an encoded NDEF message will occupy on a card, comparable with [`TagContent::capacity`].
+pub fn message_size(tech: Tech, msg: &[u8]) -> usize {
+    match tech {
+        Tech::Type4 => msg.len(),
+        _ => ndef::wrap_tlv(msg).len() - 1,
     }
 }
 
@@ -96,11 +110,7 @@ pub fn format(t: &mut impl Transport, tech: Tech) -> Result<(), String> {
 
 /// Bytes `records` will occupy on a card, comparable with [`TagContent::capacity`].
 pub fn encoded_size(tech: Tech, records: &[Record]) -> usize {
-    let msg = ndef::encode_message(records);
-    match tech {
-        Tech::Type4 => msg.len(),
-        _ => ndef::wrap_tlv(&msg).len() - 1,
-    }
+    message_size(tech, &ndef::encode_message(records))
 }
 
 fn too_big(needed: usize, capacity: usize) -> String {
@@ -108,7 +118,7 @@ fn too_big(needed: usize, capacity: usize) -> String {
 }
 
 fn empty(tech: Tech, capacity: usize, writable: bool) -> ReadOutcome {
-    ReadOutcome::Ndef(TagContent { tech, records: Vec::new(), used: 0, capacity, writable })
+    ReadOutcome::Ndef(TagContent { tech, records: Vec::new(), message: Vec::new(), used: 0, capacity, writable })
 }
 
 /// Lays out an NDEF message as a TLV for `capacity` bytes, dropping the terminator if it won't fit.
@@ -133,6 +143,7 @@ fn scan_memory(mem: &[u8], tech: Tech, capacity: usize, writable: bool) -> Resul
         TlvScan::Found(msg, used) => Ok(Some(ReadOutcome::Ndef(TagContent {
             tech,
             records: ndef::decode_message(&msg).map_err(|_| DAMAGED.to_string())?,
+            message: msg,
             used,
             capacity,
             writable,
@@ -258,6 +269,7 @@ fn read_type4(t: &mut impl Transport) -> Result<ReadOutcome, String> {
     Ok(ReadOutcome::Ndef(TagContent {
         tech: Tech::Type4,
         records,
+        message: msg,
         used: len,
         capacity: info.capacity,
         writable: info.writable,

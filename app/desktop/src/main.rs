@@ -3,9 +3,13 @@
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText};
 use nfc_studio::apdu::{self, KeyType};
 use nfc_studio::badge::{self, WedgeDecoder};
-use nfc_studio::card::{CardInfo, CardKind, Reader};
-use nfc_studio::ndef::{Record, RecordKind, WriteKind};
-use nfc_studio::tag::{self, ReadOutcome, TagContent, Transport};
+use nfc_studio::card::{CardInfo, CardKind, RawMode, Reader};
+use nfc_studio::ndef::{self, Record, RecordKind, WriteKind};
+use nfc_studio::ntag::{self, Raw};
+use nfc_studio::seal::{self, RawRecord, SealStatus, SigningKey};
+use nfc_studio::tag::{self, ReadOutcome, TagContent, Tech, Transport};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(600);
@@ -102,6 +106,119 @@ impl Transport for Link<'_> {
     }
 }
 
+/// Raw tag commands (passwords, permanent lock) through the reader's transparent channel.
+struct RawLink<'a> {
+    reader: &'a mut Reader,
+    mode: RawMode,
+    log: &'a mut Vec<String>,
+}
+
+impl<'a> RawLink<'a> {
+    fn open(reader: &'a mut Reader, log: &'a mut Vec<String>) -> Option<Self> {
+        let mode = reader.raw_begin()?;
+        push_log(log, format!("Raw channel: {mode:?}"));
+        Some(Self { reader, mode, log })
+    }
+}
+
+impl Raw for RawLink<'_> {
+    fn raw(&mut self, frame: &[u8]) -> Result<Vec<u8>, String> {
+        let r = self.reader.raw(self.mode, frame);
+        // Never log password bytes.
+        let shown = match frame.first() {
+            Some(0x1B) => "1B ** ** ** **".to_string(),
+            Some(0xA2) if frame.len() == 6 => format!("A2 {:02X} ** ** ** **", frame[1]),
+            _ => apdu::to_hex(frame),
+        };
+        match &r {
+            Ok(d) => push_log(self.log, format!("raw >> {shown}\nraw << {}", apdu::to_hex(d))),
+            Err(e) => push_log(self.log, format!("raw >> {shown}\nraw !! {e}")),
+        }
+        r
+    }
+}
+
+impl Drop for RawLink<'_> {
+    fn drop(&mut self) {
+        self.reader.raw_end(self.mode);
+    }
+}
+
+const NO_RAW: &str = "This reader can't send the commands needed for card passwords. Readers such as the \
+     ACR122U, ACR1252U or OMNIKEY 5022 can, and so can the Android app.";
+
+/// Where this computer's tamper-seal signing key is kept.
+fn seal_key_path() -> Option<PathBuf> {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return Some(PathBuf::from(appdata).join("NFC Studio").join("seal-key"));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("nfc-studio").join("seal-key"))
+}
+
+fn load_seal_key() -> Option<SigningKey> {
+    seal::key_from_bytes(&std::fs::read(seal_key_path()?).ok()?)
+}
+
+fn create_seal_key() -> Result<SigningKey, String> {
+    let path = seal_key_path().ok_or("Couldn't find a folder to keep the seal key in.")?;
+    let key = seal::generate_key();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't save the seal key: {e}"))?;
+    }
+    std::fs::write(&path, seal::key_to_bytes(&key)).map_err(|e| format!("Couldn't save the seal key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(key)
+}
+
+#[derive(Clone, Copy)]
+struct Protection {
+    /// The reader can send raw tag commands.
+    raw: bool,
+    model: Option<ntag::Model>,
+    status: ntag::Status,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PwMode {
+    /// Ask for the card password, then run the action.
+    Unlock(Action),
+    Set,
+    Change,
+    Remove,
+    Lock,
+}
+
+struct PwDialog {
+    mode: PwMode,
+    current: String,
+    new1: String,
+    new2: String,
+    limit: bool,
+    understood: bool,
+    error: Option<String>,
+}
+
+impl PwDialog {
+    fn new(mode: PwMode) -> Self {
+        Self {
+            mode,
+            current: String::new(),
+            new1: String::new(),
+            new2: String::new(),
+            limit: true,
+            understood: false,
+            error: None,
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Apdu,
@@ -114,6 +231,7 @@ enum Action {
     Write,
     Erase,
     Format,
+    Seal,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -149,6 +267,16 @@ struct App {
     notice: Option<Notice>,
     confirm: Option<Action>,
 
+    seal: SealStatus,
+    /// The card's records without the seal, exactly as stored.
+    content_raw: Vec<RawRecord>,
+    seal_key: Option<SigningKey>,
+    seal_on_write: bool,
+    protection: Option<Protection>,
+    /// Card passwords entered this session, by card ID (memory only).
+    card_passwords: HashMap<Vec<u8>, String>,
+    pw_dialog: Option<PwDialog>,
+
     view: View,
     wedge: WedgeDecoder,
     badges: Vec<BadgeScan>,
@@ -181,6 +309,13 @@ impl App {
             write_text: String::new(),
             notice: None,
             confirm: None,
+            seal: SealStatus::None,
+            content_raw: Vec::new(),
+            seal_key: load_seal_key(),
+            seal_on_write: true,
+            protection: None,
+            card_passwords: HashMap::new(),
+            pw_dialog: None,
             view: View::Cards,
             wedge: WedgeDecoder::default(),
             badges: Vec::new(),
@@ -268,6 +403,10 @@ impl App {
         self.connect_error = None;
         self.contents = None;
         self.confirm = None;
+        self.pw_dialog = None;
+        self.seal = SealStatus::None;
+        self.content_raw.clear();
+        self.protection = None;
     }
 
     fn connect_and_read(&mut self) {
@@ -310,7 +449,68 @@ impl App {
                 break;
             }
         }
+
+        self.seal = SealStatus::None;
+        self.content_raw.clear();
+        self.protection = None;
+        let uid = self.uid();
+        if let Ok(ReadOutcome::Ndef(c)) = &mut result {
+            if let Ok(raws) = seal::decode_raw(&c.message) {
+                let (status, content) = seal::verify(&uid, &raws);
+                let content: Vec<RawRecord> = content.into_iter().filter(|r| !r.is_empty_record()).collect();
+                if status != SealStatus::None {
+                    c.records = ndef::decode_message(&seal::encode_raw(&content)).unwrap_or_default();
+                }
+                self.seal = status;
+                self.content_raw = content;
+            }
+            if c.tech == Tech::Type2 {
+                self.protection = self.probe_protection(c.writable);
+            }
+        }
         self.contents = Some(result.map_err(|e| friendly_error(&e)));
+    }
+
+    fn uid(&self) -> Vec<u8> {
+        self.info.as_ref().and_then(|i| i.uid.clone()).unwrap_or_default()
+    }
+
+    /// Asks an NTAG / Ultralight EV1 tag whether it has a write password or is locked.
+    fn probe_protection(&mut self, writable: bool) -> Option<Protection> {
+        let fallback = if writable { ntag::Status::Open } else { ntag::Status::Locked };
+        let App { reader: Some(reader), log, .. } = self else { return None };
+        let Some(mut raw) = RawLink::open(reader, log) else {
+            return Some(Protection { raw: false, model: None, status: fallback });
+        };
+        let model = ntag::identify(&mut raw);
+        let status = model.and_then(|m| ntag::status(&mut raw, m).ok()).unwrap_or(fallback);
+        Some(Protection { raw: true, model, status })
+    }
+
+    fn needs_password(&self) -> bool {
+        matches!(self.protection, Some(Protection { status: ntag::Status::Password { .. }, .. }))
+    }
+
+    fn will_seal(&self) -> bool {
+        self.seal_on_write && seal::uid_is_stable(&self.uid())
+    }
+
+    fn seal_key(&mut self) -> Result<SigningKey, String> {
+        if let Some(k) = &self.seal_key {
+            return Ok(k.clone());
+        }
+        let key = create_seal_key()?;
+        self.seal_key = Some(key.clone());
+        Ok(key)
+    }
+
+    /// Bytes `records` (plus a seal, if one will be added) take on this card.
+    fn planned_size(&self, tech: Tech, records: &[Record]) -> usize {
+        let mut raws = seal::decode_raw(&ndef::encode_message(records)).unwrap_or_default();
+        if self.will_seal() && !raws.is_empty() {
+            raws.push(RawRecord { tnf: 4, rtype: seal::SEAL_TYPE.to_vec(), id: Vec::new(), payload: vec![0; 98] });
+        }
+        tag::message_size(tech, &seal::encode_raw(&raws))
     }
 
     fn ndef_content(&self) -> Option<&TagContent> {
@@ -321,6 +521,11 @@ impl App {
     }
 
     fn run(&mut self, action: Action) {
+        let changes_card = matches!(action, Action::Write | Action::Erase | Action::Seal);
+        if changes_card && self.needs_password() && !self.card_passwords.contains_key(&self.uid()) {
+            self.pw_dialog = Some(PwDialog::new(PwMode::Unlock(action)));
+            return;
+        }
         let result = match action {
             Action::Write => match self.write_kind.build(&self.write_text) {
                 Ok(rec) => self.write_records(&[rec]).map(|_| "Saved to the card."),
@@ -328,6 +533,9 @@ impl App {
             },
             Action::Erase => self.write_records(&[]).map(|_| "The card is now empty."),
             Action::Format => self.format().map(|_| "The card is set up. You can now write to it."),
+            Action::Seal => self
+                .write_raws(self.content_raw.clone(), true)
+                .map(|_| "The card is sealed. Any change or copy will now be detected."),
         };
         match result {
             Ok(msg) => {
@@ -336,15 +544,91 @@ impl App {
                 }
                 self.notify(true, msg);
             }
+            Err(e) if e == ntag::WRONG_PASSWORD => {
+                self.card_passwords.remove(&self.uid());
+                let mut d = PwDialog::new(PwMode::Unlock(action));
+                d.error = Some(e);
+                self.pw_dialog = Some(d);
+            }
             Err(e) => self.notify(false, friendly_error(&e)),
         }
         self.read_contents();
     }
 
     fn write_records(&mut self, records: &[Record]) -> Result<(), String> {
+        let raws = seal::decode_raw(&ndef::encode_message(records))?;
+        self.write_raws(raws, self.seal_on_write)
+    }
+
+    fn write_raws(&mut self, mut raws: Vec<RawRecord>, add_seal: bool) -> Result<(), String> {
         let tech = self.ndef_content().map(|c| c.tech).ok_or("Read the card first.")?;
+        let uid = self.uid();
+        if add_seal && !raws.is_empty() && seal::uid_is_stable(&uid) {
+            let key = self.seal_key()?;
+            let seal = seal::seal_record(&key, &uid, &raws);
+            raws.push(seal);
+        }
+        let msg = seal::encode_raw(&raws);
+        let password = if self.needs_password() {
+            Some(self.card_passwords.get(&uid).cloned().ok_or(ntag::WRONG_PASSWORD)?)
+        } else {
+            None
+        };
         let App { reader: Some(reader), log, .. } = self else { return Err("No reader".into()) };
-        tag::write(&mut Link { reader, log }, tech, records)
+        match password {
+            None => tag::write_message(&mut Link { reader, log }, tech, &msg),
+            Some(pw) => {
+                let mut raw = RawLink::open(reader, log).ok_or(NO_RAW)?;
+                ntag::authenticate(&mut raw, &pw, &uid)?;
+                tag::write_message(&mut ntag::RawTransport(&mut raw), tech, &msg)
+            }
+        }
+    }
+
+    /// Runs a password / lock change from the dialog; returns the success message.
+    fn apply_protection(&mut self, d: &PwDialog) -> Result<&'static str, String> {
+        let uid = self.uid();
+        let model = self.protection.and_then(|p| p.model);
+        let current = (!d.current.is_empty()).then_some(d.current.as_str());
+        if matches!(d.mode, PwMode::Set | PwMode::Change) {
+            if d.new1.chars().count() < 4 {
+                return Err("Choose a password of at least 4 characters.".into());
+            }
+            if d.new1 != d.new2 {
+                return Err("The two passwords don't match.".into());
+            }
+        }
+        if d.mode == PwMode::Lock && !d.understood {
+            return Err("Tick the box to confirm you understand this can't be undone.".into());
+        }
+        let App { reader: Some(reader), log, .. } = self else { return Err("No reader".into()) };
+        let mut raw = RawLink::open(reader, log).ok_or(NO_RAW)?;
+        let need_model = || model.ok_or_else(|| "This tag type doesn't support a password.".to_string());
+        let msg = match d.mode {
+            PwMode::Set | PwMode::Change => {
+                ntag::set_password(&mut raw, need_model()?, &uid, &d.new1, d.limit, current)?;
+                "Password set. The card can now only be changed with it."
+            }
+            PwMode::Remove => {
+                ntag::remove_password(&mut raw, need_model()?, &uid, &d.current)?;
+                "Password removed. Anyone can change the card again."
+            }
+            PwMode::Lock => {
+                ntag::lock_forever(&mut raw, model, &uid, current)?;
+                "The card is now locked permanently."
+            }
+            PwMode::Unlock(_) => unreachable!(),
+        };
+        drop(raw);
+        match d.mode {
+            PwMode::Set | PwMode::Change => {
+                self.card_passwords.insert(uid, d.new1.clone());
+            }
+            _ => {
+                self.card_passwords.remove(&uid);
+            }
+        }
+        Ok(msg)
     }
 
     fn format(&mut self) -> Result<(), String> {
@@ -661,6 +945,7 @@ impl App {
                     }
                 }
                 Some(Ok(ReadOutcome::Ndef(c))) => {
+                    self.seal_badge_ui(ui);
                     if c.records.is_empty() {
                         ui.add_space(6.0);
                         ui.label(RichText::new("This card is empty.").size(16.0));
@@ -679,10 +964,261 @@ impl App {
                     );
                     if !c.writable {
                         ui.label("🔒 This card is locked, so its contents can't be changed.");
+                    } else if self.needs_password() {
+                        ui.label("🔑 Changes to this card need its password.");
                     }
                 }
             }
         });
+    }
+
+    fn seal_badge_ui(&mut self, ui: &mut egui::Ui) {
+        let mine = self.seal_key.as_ref().map(seal::public_key);
+        let (color, text) = match &self.seal {
+            SealStatus::None => return,
+            SealStatus::Valid { key } if Some(key) == mine.as_ref() => {
+                (GOOD, "🛡 Sealed by you. Nothing has changed since it was sealed.".to_string())
+            }
+            SealStatus::Valid { key } => (
+                GOOD,
+                format!(
+                    "🛡 Sealed by another device (key {}). Nothing has changed since it was sealed.",
+                    seal::fingerprint(key)
+                ),
+            ),
+            SealStatus::Broken => (
+                BAD,
+                "⚠ Seal broken! This card was changed, or its content was copied from another card, after it \
+                 was sealed. Don't trust what's on it."
+                    .to_string(),
+            ),
+        };
+        egui::Frame::none()
+            .stroke(egui::Stroke::new(1.5_f32, color))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(text).color(color).strong()).wrap());
+            });
+        ui.add_space(4.0);
+    }
+
+    fn protection_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(content) = self.ndef_content().cloned() else { return };
+        let uid = self.uid();
+        section(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("🛡 Protection").size(18.0).strong());
+            ui.add_space(4.0);
+
+            ui.label(RichText::new("Tamper seal").strong());
+            if seal::uid_is_stable(&uid) {
+                ui.checkbox(&mut self.seal_on_write, "Seal the card whenever I write to it");
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "A digital signature tied to this card's ID. If anyone changes the content, or copies \
+                             it to another card, NFC Studio shows “Seal broken”.",
+                        )
+                        .weak(),
+                    )
+                    .wrap(),
+                );
+                let mine = self.seal_key.as_ref().map(seal::public_key);
+                let sealed_by_me = matches!(&self.seal, SealStatus::Valid { key } if Some(key) == mine.as_ref());
+                if content.writable && !self.content_raw.is_empty() && !sealed_by_me {
+                    if ui.button("🛡 Seal what's on the card now").clicked() {
+                        self.confirm = Some(Action::Seal);
+                    }
+                }
+                if let Some(key) = &mine {
+                    ui.weak(format!("This computer's seal key: {}", seal::fingerprint(key)));
+                }
+            } else {
+                ui.weak("This card's ID changes every time it's read, so it can't be sealed.");
+            }
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Write protection").strong());
+            match self.protection {
+                None => {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "A write password and permanent lock are available for NTAG213/215/216 and \
+                                 MIFARE Ultralight EV1 tags. Use the tamper seal to protect this card.",
+                            )
+                            .weak(),
+                        )
+                        .wrap(),
+                    );
+                }
+                Some(Protection { raw: false, .. }) => {
+                    ui.add(egui::Label::new(RichText::new(NO_RAW).weak()).wrap());
+                }
+                Some(p) => {
+                    match p.status {
+                        ntag::Status::Open => {
+                            ui.label("🔓 Anyone can change this card.");
+                        }
+                        ntag::Status::Password { limited } => {
+                            ui.label("🔑 Changes need the card password. Anyone can still read it.");
+                            if limited {
+                                ui.weak("After 7 wrong passwords in a row the card can never be changed again.");
+                            }
+                        }
+                        ntag::Status::Locked => {
+                            ui.label("🔒 Locked permanently. Nobody can ever change this card.");
+                        }
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let has_pw = matches!(p.status, ntag::Status::Password { .. });
+                        if p.model.is_some() {
+                            match p.status {
+                                ntag::Status::Open => {
+                                    if ui.button("🔑 Set password…").clicked() {
+                                        self.pw_dialog = Some(PwDialog::new(PwMode::Set));
+                                    }
+                                }
+                                ntag::Status::Password { .. } => {
+                                    if ui.button("Change password…").clicked() {
+                                        self.pw_dialog = Some(PwDialog::new(PwMode::Change));
+                                    }
+                                    if ui.button("Remove password…").clicked() {
+                                        self.pw_dialog = Some(PwDialog::new(PwMode::Remove));
+                                    }
+                                }
+                                ntag::Status::Locked => {}
+                            }
+                        } else if p.status != ntag::Status::Locked {
+                            ui.weak("This tag type doesn't support a password.");
+                        }
+                        if p.status != ntag::Status::Locked && (p.model.is_some() || content.capacity <= 48) {
+                            let mut d = PwDialog::new(PwMode::Lock);
+                            // For locking, `limit` records whether the current password must be entered.
+                            d.limit = has_pw;
+                            if ui.button("🔒 Lock permanently…").clicked() {
+                                self.pw_dialog = Some(d);
+                            }
+                        }
+                    });
+                }
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Write protection stops changes but not reading. Keep secrets in the Android app's \
+                         PIN-protected items.",
+                    )
+                    .weak()
+                    .small(),
+                )
+                .wrap(),
+            );
+        });
+    }
+
+    fn pw_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.pw_dialog.take() else { return };
+        let needs_current = match d.mode {
+            PwMode::Unlock(_) | PwMode::Change | PwMode::Remove => true,
+            PwMode::Lock => d.limit,
+            PwMode::Set => false,
+        };
+        let needs_new = matches!(d.mode, PwMode::Set | PwMode::Change);
+        let (title, body, button) = match d.mode {
+            PwMode::Unlock(_) => ("Card password", "This card is write-protected. Enter its password to save changes.", "Continue"),
+            PwMode::Set => (
+                "Set a card password",
+                "The card stays readable by anyone, but changing or erasing it will need this password. \
+                 It's stored in the card's chip.",
+                "Set password",
+            ),
+            PwMode::Change => ("Change card password", "Enter the current password, then the new one.", "Change password"),
+            PwMode::Remove => ("Remove card password", "Anyone will be able to change the card again.", "Remove password"),
+            PwMode::Lock => (
+                "Lock card permanently?",
+                "The card becomes read-only forever. Nobody, including you, will ever be able to change or erase \
+                 it again. Its current content stays readable.",
+                "Lock forever",
+            ),
+        };
+        let (mut submit, mut cancel) = (false, false);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(400.0);
+                ui.add(egui::Label::new(body).wrap());
+                ui.add_space(8.0);
+                let field = |ui: &mut egui::Ui, label: &str, value: &mut String| {
+                    ui.label(label);
+                    ui.add(egui::TextEdit::singleline(value).password(true).desired_width(f32::INFINITY))
+                };
+                if needs_current {
+                    let r = field(ui, "Current card password", &mut d.current);
+                    if !needs_new && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                }
+                if needs_new {
+                    field(ui, "New password", &mut d.new1);
+                    field(ui, "Repeat new password", &mut d.new2);
+                    ui.checkbox(&mut d.limit, "Freeze the card after 7 wrong passwords (stops guessing)");
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Tags only hold a short (32-bit) password, so keep the freeze on. There's no way to \
+                                 recover a forgotten password, though the card stays readable.",
+                            )
+                            .weak()
+                            .small(),
+                        )
+                        .wrap(),
+                    );
+                }
+                if d.mode == PwMode::Lock {
+                    ui.checkbox(&mut d.understood, "I understand this can never be undone");
+                }
+                if let Some(e) = &d.error {
+                    ui.colored_label(BAD, e);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    submit |= ui.add(primary(button)).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            return;
+        }
+        if !submit {
+            self.pw_dialog = Some(d);
+            return;
+        }
+        if let PwMode::Unlock(action) = d.mode {
+            if d.current.is_empty() {
+                d.error = Some("Enter the card password.".into());
+                self.pw_dialog = Some(d);
+                return;
+            }
+            self.card_passwords.insert(self.uid(), d.current.clone());
+            self.run(action);
+            return;
+        }
+        match self.apply_protection(&d) {
+            Ok(msg) => {
+                self.notify(true, msg);
+                self.read_contents();
+            }
+            Err(e) => {
+                d.error = Some(friendly_error(&e));
+                self.pw_dialog = Some(d);
+            }
+        }
     }
 
     fn record_ui(&mut self, ui: &mut egui::Ui, rec: &Record) {
@@ -766,13 +1302,14 @@ impl App {
             let mut can_write = false;
             match &built {
                 Some(Ok(rec)) => {
-                    let size = tag::encoded_size(content.tech, std::slice::from_ref(rec));
+                    let size = self.planned_size(content.tech, std::slice::from_ref(rec));
                     can_write = size <= content.capacity;
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("Will write:");
                         ui.label(format!("{} {}", rec.kind().icon(), rec.summary()));
                     });
-                    let size_text = format!("Needs {size} of {} bytes", content.capacity);
+                    let seal_note = if self.will_seal() { " (including the tamper seal)" } else { "" };
+                    let size_text = format!("Needs {size} of {} bytes{seal_note}", content.capacity);
                     if can_write {
                         ui.weak(size_text);
                     } else {
@@ -823,6 +1360,12 @@ impl App {
                  Keep the card still on the reader until it finishes.",
                 "Set up card",
             ),
+            Action::Seal => (
+                "Seal this card?",
+                "A digital seal tied to this card's ID is added to its current content. From now on, any change \
+                 to the content, or copying it to another card, will show as “Seal broken”.",
+                "Seal card",
+            ),
         };
         let (mut go, mut cancel) = (false, false);
         egui::Window::new(title)
@@ -861,11 +1404,15 @@ impl App {
                         ui.columns(2, |cols| {
                             self.contents_ui(&mut cols[0]);
                             self.write_ui(&mut cols[1]);
+                            cols[1].add_space(8.0);
+                            self.protection_ui(&mut cols[1]);
                         });
                     } else {
                         self.contents_ui(ui);
                         ui.add_space(8.0);
                         self.write_ui(ui);
+                        ui.add_space(8.0);
+                        self.protection_ui(ui);
                     }
                 });
             });
@@ -1176,6 +1723,7 @@ impl eframe::App for App {
         } else {
             self.simple_ui(ctx);
             self.confirm_ui(ctx);
+            self.pw_dialog_ui(ctx);
         }
     }
 }

@@ -75,7 +75,10 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     override fun onStop() {
         super.onStop()
         // Re-lock protected items when the app goes to the background.
-        if (!isChangingConfigurations) vm.hideSecrets()
+        if (!isChangingConfigurations) {
+            vm.hideSecrets()
+            vm.forgetCardPasswords()
+        }
     }
 
     override fun onDestroy() {
