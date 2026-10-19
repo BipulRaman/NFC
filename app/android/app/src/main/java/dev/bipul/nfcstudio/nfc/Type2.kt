@@ -11,19 +11,37 @@ class WrongPasswordException : Type2Exception("Wrong card password.")
 /** The card has a write password and none was given. */
 class NeedsPasswordException : Type2Exception("This card is protected with a password.")
 
+/** The card left the field; unlike a refused command, retrying won't help until it's tapped again. */
+class CardGoneException : IOException("The card moved away.")
+
 enum class NtagModel(val label: String, val cfgPage: Int) {
     NTAG213("NTAG213", 0x29),
     NTAG215("NTAG215", 0x83),
     NTAG216("NTAG216", 0xE3),
     UL_EV1_SMALL("MIFARE Ultralight EV1", 0x10),
-    UL_EV1_LARGE("MIFARE Ultralight EV1", 0x25),
+    UL_EV1_LARGE("MIFARE Ultralight EV1", 0x25);
+
+    private val isNtag get() = this == NTAG213 || this == NTAG215 || this == NTAG216
+
+    /** AUTHLIM value for the wrong-password limit: NTAG allows 2^AUTHLIM tries, Ultralight EV1 AUTHLIM. */
+    val authLimit get() = if (isNtag) 3 else 7
+
+    /** Wrong passwords in a row before a card configured with [authLimit] freezes. */
+    val maxAttempts get() = if (isNtag) 8 else 7
+
+    fun attemptsFor(authLimit: Int) = if (authLimit == 0) 0 else if (isNtag) 1 shl authLimit else authLimit
 }
 
 sealed interface WriteProtection {
     data object Open : WriteProtection
-    data class Password(val limited: Boolean) : WriteProtection
+
+    /** [readProtected]: even reading the card's content needs the password. */
+    data class Password(val limited: Boolean, val readProtected: Boolean = false) : WriteProtection
     data object Locked : WriteProtection
 }
+
+/** An NDEF message read straight from Type 2 tag memory. */
+class Type2Ndef(val message: ByteArray, val used: Int, val capacity: Int, val writable: Boolean)
 
 /** How a typed password becomes the chip's 4-byte PWD, depending on which app set it. */
 enum class PasswordScheme(val label: String) {
@@ -72,15 +90,75 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
 
     fun status(model: NtagModel): WriteProtection {
         val head = read4(0)
-        val cfg = read4(model.cfgPage)
         val ccReadOnly = head[15].toInt() and 0x0F == 0x0F
         val staticLocked = head[10] == 0xFF.toByte() && head[11] == 0xFF.toByte()
+        if (ccReadOnly && staticLocked) return WriteProtection.Locked
+        val cfg = try {
+            read4(model.cfgPage)
+        } catch (e: CardGoneException) {
+            throw e
+        } catch (e: IOException) {
+            // The configuration is only unreadable when reading is password-protected.
+            return WriteProtection.Password(limited = true, readProtected = true)
+        }
         val auth0 = cfg[3].toInt() and 0xFF
         return when {
-            ccReadOnly && staticLocked -> WriteProtection.Locked
-            auth0 <= model.cfgPage + 3 -> WriteProtection.Password(limited = cfg[4].toInt() and 0x07 != 0)
+            auth0 <= model.cfgPage + 3 -> WriteProtection.Password(
+                limited = cfg[4].toInt() and 0x07 != 0,
+                readProtected = cfg[4].toInt() and 0x80 != 0,
+            )
             else -> WriteProtection.Open
         }
+    }
+
+    /** Reads the NDEF message directly; null when the tag isn't set up for NFC messages. */
+    fun readNdef(): Type2Ndef? {
+        val head = read4(3)
+        if (head[0] != 0xE1.toByte()) return null
+        val capacity = (head[2].toInt() and 0xFF) * 8
+        val writable = head[3].toInt() and 0x0F == 0
+        var mem = head.copyOfRange(4, 16)
+        var page = 7
+        while (true) {
+            val area = mem.copyOf(minOf(mem.size, capacity))
+            when (val s = Tlv.scan(area)) {
+                is TlvScan.Found -> return Type2Ndef(s.message, s.used, capacity, writable)
+                TlvScan.Empty -> return Type2Ndef(ByteArray(0), 0, capacity, writable)
+                TlvScan.Incomplete -> {
+                    if (mem.size >= capacity) {
+                        if (area.all { it == 0.toByte() }) return Type2Ndef(ByteArray(0), 0, capacity, writable)
+                        throw Type2Exception("The data on this card is damaged.")
+                    }
+                    mem += read4(page)
+                    page += 4
+                }
+            }
+        }
+    }
+
+    /** Human-readable protection details for the memory dump. */
+    fun describe(): List<String> {
+        val out = mutableListOf<String>()
+        val model = identify()
+        out += "Chip: ${model?.label ?: "unknown (no GET_VERSION answer)"}"
+        val head = read4(0)
+        out += "Static lock bytes: %02X %02X · CC: %02X %02X %02X %02X".format(
+            head[10], head[11], head[12], head[13], head[14], head[15],
+        )
+        if (model != null) {
+            val cfg = runCatching { read4(model.cfgPage) }.getOrNull()
+            if (cfg == null) {
+                out += "Configuration: unreadable, so reading is password-protected"
+            } else {
+                val auth0 = cfg[3].toInt() and 0xFF
+                out += "AUTH0: %02X (%s)".format(auth0, if (auth0 <= model.cfgPage + 3) "protected from page $auth0" else "no password")
+                out += "PROT (read protection): ${if (cfg[4].toInt() and 0x80 != 0) "on" else "off"}"
+                val limit = cfg[4].toInt() and 0x07
+                out += "AUTHLIM: ${if (limit == 0) "unlimited attempts" else "freezes after ${model.attemptsFor(limit)} wrong passwords"}"
+                out += "CFGLCK (settings locked): ${if (cfg[4].toInt() and 0x40 != 0) "yes" else "no"}"
+            }
+        }
+        return out
     }
 
     fun authenticate(password: String, scheme: PasswordScheme = PasswordScheme.NFC_STUDIO) {
@@ -108,7 +186,7 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
         val (pwd, pack) = derive(newPassword, uid)
         write(model.cfgPage + 2, pwd)
         write(model.cfgPage + 3, pack + byteArrayOf(0, 0))
-        configure(model, PROTECT_FROM, if (limitAttempts) ATTEMPT_LIMIT else 0)
+        configure(model, PROTECT_FROM, if (limitAttempts) model.authLimit else 0)
         try {
             authenticate(newPassword)
         } catch (e: Type2Exception) {
@@ -190,7 +268,6 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
     }
 
     companion object {
-        const val ATTEMPT_LIMIT = 7
         private const val PROTECT_FROM = 4
         const val LOCKED_FOREVER = "This card is locked permanently, so it can never be erased. " +
             "That's what makes the lock tamper-proof."

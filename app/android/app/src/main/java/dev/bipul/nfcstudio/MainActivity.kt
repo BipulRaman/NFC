@@ -12,6 +12,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import dev.bipul.nfcstudio.ui.AppViewModel
@@ -39,6 +40,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             NfcStudioTheme {
                 NfcStudioApp(vm, setSecure = ::setSecure)
             }
+            LaunchedEffect(vm.deepScan) { refreshNfc() }
         }
         ContextCompat.registerReceiver(
             this,
@@ -94,8 +96,9 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             else -> NfcState.READY
         }
         if (nfc != null && nfc.isEnabled && resumed) {
-            val flags = NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
+            var flags = NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
                 NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_NFC_V
+            if (vm.deepScan) flags = flags or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
             val extras = Bundle().apply { putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 250) }
             nfc.enableReaderMode(this, this, flags, extras)
         }

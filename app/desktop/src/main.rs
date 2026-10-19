@@ -6,6 +6,7 @@ use nfc_studio::badge::{self, WedgeDecoder};
 use nfc_studio::card::{CardInfo, CardKind, RawMode, Reader};
 use nfc_studio::ndef::{self, Record, RecordKind, WriteKind};
 use nfc_studio::ntag::{self, Raw};
+use nfc_studio::rawjson;
 use nfc_studio::seal::{self, RawRecord, SealStatus, SigningKey};
 use nfc_studio::tag::{self, ReadOutcome, TagContent, Tech, Transport};
 use std::collections::HashMap;
@@ -68,6 +69,18 @@ fn push_log(log: &mut Vec<String>, msg: impl Into<String>) {
     if log.len() > 500 {
         log.drain(..100);
     }
+}
+
+/// Monospace, selectable JSON in a tinted box.
+fn json_block(ui: &mut egui::Ui, json: &str) {
+    egui::Frame::none()
+        .fill(ui.visuals().extreme_bg_color)
+        .rounding(6.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(json).monospace()).wrap().selectable(true));
+        });
 }
 
 /// Turns low-level reader errors into something a person can act on.
@@ -280,6 +293,7 @@ struct App {
     /// Card passwords entered this session, by card ID (memory only).
     card_passwords: HashMap<Vec<u8>, String>,
     pw_dialog: Option<PwDialog>,
+    show_raw: bool,
 
     view: View,
     wedge: WedgeDecoder,
@@ -320,6 +334,7 @@ impl App {
             protection: None,
             card_passwords: HashMap::new(),
             pw_dialog: None,
+            show_raw: false,
             view: View::Cards,
             wedge: WedgeDecoder::default(),
             badges: Vec::new(),
@@ -408,6 +423,7 @@ impl App {
         self.contents = None;
         self.confirm = None;
         self.pw_dialog = None;
+        self.show_raw = false;
         self.seal = SealStatus::None;
         self.content_raw.clear();
         self.protection = None;
@@ -924,6 +940,11 @@ impl App {
                     if ui.button("⟳ Read again").clicked() {
                         self.read_contents();
                     }
+                    if self.ndef_content().is_some()
+                        && ui.button("{ } Raw data").on_hover_text("Everything on the card as JSON").clicked()
+                    {
+                        self.show_raw = true;
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -1076,7 +1097,10 @@ impl App {
                         ntag::Status::Password { limited } => {
                             ui.label("🔑 Changes need the card password. Anyone can still read it.");
                             if limited {
-                                ui.weak("After 7 wrong passwords in a row the card can never be changed again.");
+                                ui.weak(format!(
+                                    "After {} wrong passwords in a row the card can never be changed again.",
+                                    p.model.map_or(8, ntag::Model::max_attempts)
+                                ));
                             }
                         }
                         ntag::Status::Locked => {
@@ -1152,6 +1176,7 @@ impl App {
             PwMode::Set => false,
         };
         let needs_new = matches!(d.mode, PwMode::Set | PwMode::Change);
+        let attempts = self.protection.and_then(|p| p.model).map_or(8, ntag::Model::max_attempts);
         let (title, body, button) = match d.mode {
             PwMode::Unlock(_) => ("Card password", "This card is write-protected. Enter its password to save changes.", "Continue"),
             PwMode::Set => (
@@ -1209,14 +1234,14 @@ impl App {
                     {
                         ui.colored_label(
                             BAD,
-                            "Careful: this card freezes for good after 7 wrong passwords in a row.",
+                            format!("Careful: this card freezes for good after {attempts} wrong passwords in a row."),
                         );
                     }
                 }
                 if needs_new {
                     field(ui, "New password", &mut d.new1);
                     field(ui, "Repeat new password", &mut d.new2);
-                    ui.checkbox(&mut d.limit, "Freeze the card after 7 wrong passwords (stops guessing)");
+                    ui.checkbox(&mut d.limit, format!("Freeze the card after {attempts} wrong passwords (stops guessing)"));
                     ui.add(
                         egui::Label::new(
                             RichText::new(
@@ -1273,6 +1298,15 @@ impl App {
     fn record_ui(&mut self, ui: &mut egui::Ui, rec: &Record) {
         let kind = rec.kind();
         let summary = rec.summary();
+        let raw_json = match rec {
+            Record::Other { tnf, rtype, payload } => Some(rawjson::pretty(&rawjson::record(&RawRecord {
+                tnf: *tnf,
+                rtype: rtype.clone(),
+                id: Vec::new(),
+                payload: payload.clone(),
+            }))),
+            _ => None,
+        };
         egui::Frame::none()
             .fill(ui.visuals().extreme_bg_color)
             .rounding(8.0)
@@ -1300,11 +1334,66 @@ impl App {
                                 ui.ctx().copy_text(summary.clone());
                                 self.notify(true, "Copied.");
                             }
+                            if let Some(json) = &raw_json {
+                                if ui.small_button("📋 Copy JSON").clicked() {
+                                    ui.ctx().copy_text(json.clone());
+                                    self.notify(true, "Raw data copied as JSON.");
+                                }
+                            }
                         });
+                        if let Some(json) = &raw_json {
+                            ui.weak("Unrecognised format, shown as raw data:");
+                            json_block(ui, json);
+                        }
                     });
                 });
             });
         ui.add_space(2.0);
+    }
+
+    fn raw_window_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_raw {
+            return;
+        }
+        let Some(c) = self.ndef_content() else {
+            self.show_raw = false;
+            return;
+        };
+        let info = self.info.as_ref();
+        let card = serde_json::json!({
+            "id": info.and_then(|i| i.uid.as_deref()).map(apdu::to_hex),
+            "type": info.map(|i| i.kind.label()),
+            "capacity": c.capacity,
+            "used": c.used,
+            "writable": c.writable,
+            "seal": match &self.seal {
+                SealStatus::None => "none".to_string(),
+                SealStatus::Valid { key } => format!("valid (key {})", seal::fingerprint(key)),
+                SealStatus::Broken => "broken".to_string(),
+            },
+            "protection": match self.protection.map(|p| p.status) {
+                None | Some(ntag::Status::Open) => "none",
+                Some(ntag::Status::Password { .. }) => "password",
+                Some(ntag::Status::Locked) => "locked permanently",
+            },
+        });
+        let raws = seal::decode_raw(&c.message).unwrap_or_default();
+        let json = rawjson::pretty(&serde_json::json!({ "card": card, "records": rawjson::records(&raws) }));
+        let mut open = true;
+        let mut copy = false;
+        egui::Window::new("Raw data (JSON)")
+            .open(&mut open)
+            .default_size([520.0, 420.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                copy = ui.button("📋 Copy JSON").clicked();
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| json_block(ui, &json));
+            });
+        if copy {
+            ctx.copy_text(json);
+            self.notify(true, "Raw data copied as JSON.");
+        }
+        self.show_raw = open;
     }
 
     fn write_ui(&mut self, ui: &mut egui::Ui) {
@@ -1773,6 +1862,7 @@ impl eframe::App for App {
             self.simple_ui(ctx);
             self.confirm_ui(ctx);
             self.pw_dialog_ui(ctx);
+            self.raw_window_ui(ctx);
         }
     }
 }

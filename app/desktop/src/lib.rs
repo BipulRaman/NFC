@@ -5,6 +5,7 @@ pub mod apdu;
 pub mod badge;
 pub mod ndef;
 pub mod ntag;
+pub mod rawjson;
 pub mod seal;
 pub mod tag;
 

@@ -75,6 +75,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     var nfc by mutableStateOf(NfcState.READY)
     var screen by mutableStateOf(Screen.HOME)
+
+    /** Skips Android's own content check so cards it silently ignores (e.g. read-protected) are still found. */
+    var deepScan by mutableStateOf(false)
     var card by mutableStateOf<CardSnapshot?>(null)
         private set
     val draft = mutableStateListOf<Entry>()

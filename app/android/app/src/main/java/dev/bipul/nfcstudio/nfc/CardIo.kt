@@ -53,23 +53,28 @@ object CardIo {
         val snap = readContent(tag)
         val (seal, content) = Seal.verify(tag.id, snap.records)
         var result = snap.copy(records = content, seal = seal)
-        if (MifareUltralight.get(tag) != null && snap.supported) {
+        if (MifareUltralight.get(tag) != null) {
             val protection = runCatching {
                 withType2(tag) { t ->
                     val model = t.identify()
-                    val fallback = if (snap.writable) WriteProtection.Open else WriteProtection.Locked
+                    val fallback = if (snap.writable || !snap.supported) WriteProtection.Open else WriteProtection.Locked
                     Protection(model, model?.let { m -> runCatching { t.status(m) }.getOrNull() } ?: fallback)
                 }
             }.getOrNull()
+            val readProtected = (protection?.status as? WriteProtection.Password)?.readProtected == true
             result = result.copy(
                 protection = protection,
                 // Our permanent lock works on password-protected tags too.
                 canMakeReadOnly = result.canMakeReadOnly ||
-                    (protection?.model != null && protection.status != WriteProtection.Locked),
+                    (protection?.model != null && protection.status != WriteProtection.Locked && !readProtected),
+                notice = if (readProtected && !snap.supported) READ_PROTECTED else result.notice,
             )
         }
         return result
     }
+
+    private const val READ_PROTECTED = "This card is read-protected: its content can only be read with its password. " +
+        "If you know the password, you can erase it completely to reuse it (menu ⋮ → Erase completely)."
 
     private fun readContent(tag: Tag): CardSnapshot {
         val techs = tag.techList.map { it.substringAfterLast('.') }
@@ -99,6 +104,18 @@ object CardIo {
             }
         }
         if (NfcV.get(tag) != null) return guard { readType5(tag, name, techs) }
+        // Android skipped NDEF (deep scan, or its own check failed): read Type 2 tags directly.
+        if (MifareUltralight.get(tag) != null) {
+            runCatching { withType2(tag) { it.readNdef() } }.getOrNull()?.let { n ->
+                val (records, damaged) = parseMessage(n.message)
+                return CardSnapshot(
+                    id = tag.id, typeName = name, techs = techs, records = records,
+                    capacity = n.capacity - if (n.capacity - 2 < 0xFF) 2 else 4,
+                    used = if (records.isEmpty()) 0 else records.sumOf(RawRecord::byteSize),
+                    writable = n.writable, canMakeReadOnly = false, blank = false, notice = null, damaged = damaged,
+                )
+            }
+        }
         if (NdefFormatable.get(tag) != null) {
             return CardSnapshot(tag.id, name, techs, emptyList(), null, 0, true, false, true, null)
         }
@@ -166,25 +183,40 @@ object CardIo {
         val ul = MifareUltralight.get(tag) ?: throw CardException("This card doesn't support write protection.")
         return ul.use {
             it.connect()
+            // A refused command sends the tag to sleep; reselect it so the next command works.
+            val recover = { runCatching { it.close(); it.connect() }; Unit }
             val io = Transceiver { frame ->
-                when (frame[0].toInt() and 0xFF) {
-                    // NAKs arrive as exceptions on Android; report them as a 1-byte NAK instead.
-                    0xA2 -> try {
-                        it.writePage(frame[1].toInt() and 0xFF, frame.copyOfRange(2, 6))
-                        byteArrayOf(0x0A)
-                    } catch (e: TagLostException) {
-                        throw e
-                    } catch (e: IOException) {
-                        byteArrayOf(0x00)
+                try {
+                    when (frame[0].toInt() and 0xFF) {
+                        // NAKs arrive as exceptions on Android; report them as a 1-byte NAK instead.
+                        0xA2 -> try {
+                            it.writePage(frame[1].toInt() and 0xFF, frame.copyOfRange(2, 6))
+                            byteArrayOf(0x0A)
+                        } catch (e: TagLostException) {
+                            throw e
+                        } catch (e: IOException) {
+                            recover()
+                            byteArrayOf(0x00)
+                        }
+                        0x1B -> try {
+                            it.transceive(frame)
+                        } catch (e: TagLostException) {
+                            throw e
+                        } catch (e: IOException) {
+                            recover()
+                            byteArrayOf(0x00)
+                        }
+                        else -> try {
+                            it.transceive(frame)
+                        } catch (e: TagLostException) {
+                            throw e
+                        } catch (e: IOException) {
+                            recover()
+                            throw e
+                        }
                     }
-                    0x1B -> try {
-                        it.transceive(frame)
-                    } catch (e: TagLostException) {
-                        throw e
-                    } catch (e: IOException) {
-                        byteArrayOf(0x00)
-                    }
-                    else -> it.transceive(frame)
+                } catch (e: TagLostException) {
+                    throw CardGoneException()
                 }
             }
             block(Type2Tag(io, tag.id))
@@ -200,16 +232,22 @@ object CardIo {
         }
         guard {
             if (MifareUltralight.get(tag) != null) {
+                val androidCanWrite = Ndef.get(tag) != null || NdefFormatable.get(tag) != null
                 val done = withType2(tag) { t ->
-                    val model = t.identify() ?: return@withType2 false
-                    when (t.status(model)) {
+                    val status = t.identify()?.let(t::status) ?: WriteProtection.Open
+                    when (status) {
                         WriteProtection.Locked -> throw CardException("This card is locked permanently, so it can't be changed.")
                         is WriteProtection.Password -> {
                             t.authenticate(password ?: throw NeedsPasswordException())
                             t.writeNdef(messageFor(all).toByteArray())
                             true
                         }
-                        WriteProtection.Open -> false
+                        WriteProtection.Open -> if (androidCanWrite) {
+                            false
+                        } else {
+                            t.writeNdef(messageFor(all).toByteArray())
+                            true
+                        }
                     }
                 }
                 if (done) return@guard
@@ -304,11 +342,15 @@ object CardIo {
             "Technologies: ${tag.techList.joinToString { it.substringAfterLast('.') }}",
         )
         MifareUltralight.get(tag)?.let { ul ->
+            out += runCatching { withType2(tag) { it.describe() } }.getOrElse { listOf("Chip details: couldn't be read") }
             ul.use {
                 it.connect()
                 var page = 0
                 while (page < 256) {
-                    val chunk = try { it.readPages(page) } catch (e: IOException) { break }
+                    val chunk = try { it.readPages(page) } catch (e: IOException) {
+                        if (page < 16) out += "Pages from $page on can't be read (read-protected or end of memory)."
+                        break
+                    }
                     for (p in 0 until 4) {
                         val bytes = chunk.copyOfRange(p * 4, p * 4 + 4)
                         out += "Page %3d: %s  %s".format(page + p, NfcCore.toHex(bytes), NfcCore.toAscii(bytes))
@@ -403,6 +445,16 @@ object CardIo {
 
     private fun toRaw(r: NdefRecord) = RawRecord(r.tnf, r.type ?: ByteArray(0), r.payload ?: ByteArray(0), r.id ?: ByteArray(0))
 
+    /** Records in a raw NDEF message (empty ones dropped), and whether it was damaged. */
+    private fun parseMessage(message: ByteArray): Pair<List<RawRecord>, Boolean> {
+        if (message.isEmpty()) return emptyList<RawRecord>() to false
+        return try {
+            NdefMessage(message).records.map(::toRaw).filter { it.tnf != RawRecord.TNF_EMPTY } to false
+        } catch (e: FormatException) {
+            emptyList<RawRecord>() to true
+        }
+    }
+
     private fun toNdef(r: RawRecord) = NdefRecord(r.tnf, r.type, r.id, r.payload)
 
     /** Maps radio errors to messages a person can act on. */
@@ -415,6 +467,8 @@ object CardIo {
     } catch (e: WrongPasswordException) {
         throw e
     } catch (e: TagLostException) {
+        throw CardException("The card moved away too soon. Hold it still against the phone and try again.")
+    } catch (e: CardGoneException) {
         throw CardException("The card moved away too soon. Hold it still against the phone and try again.")
     } catch (e: Type2Exception) {
         throw CardException(e.message ?: "The tag didn't respond as expected. Try again.")

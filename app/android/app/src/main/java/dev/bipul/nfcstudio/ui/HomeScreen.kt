@@ -30,6 +30,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -74,6 +75,27 @@ fun HomeScreen(vm: AppViewModel, snackbar: SnackbarHostState) {
                         textAlign = TextAlign.Center,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.height(12.dp))
+                    if (vm.deepScan) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    "Deep scan is on: cards your phone normally ignores, such as read-protected ones, are read directly.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = { vm.deepScan = false }) { Text("Turn off") }
+                            }
+                        }
+                    } else {
+                        TextButton(onClick = {
+                            vm.deepScan = true
+                            vm.say("Deep scan is on. Hold the card to the phone again.")
+                        }) { Text("Card not detected? Try deep scan") }
+                    }
                 }
                 NfcState.OFF -> {
                     Icon(Icons.Outlined.Nfc, null, Modifier.size(96.dp), tint = MaterialTheme.colorScheme.error)

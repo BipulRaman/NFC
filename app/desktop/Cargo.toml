@@ -26,6 +26,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 md-5 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 
 [build-dependencies]

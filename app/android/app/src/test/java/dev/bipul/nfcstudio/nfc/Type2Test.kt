@@ -48,7 +48,11 @@ class Type2Test {
             return when (frame[0].toInt() and 0xFF) {
                 0x60 -> byteArrayOf(0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x11, 0x03)
                 0x30 -> {
-                    val p = (frame[1].toInt() and 0xFF) * 4
+                    val page = frame[1].toInt() and 0xFF
+                    val auth0 = mem[cfg + 3].toInt() and 0xFF
+                    val prot = mem[cfg + 4].toInt() and 0x80 != 0
+                    if (prot && !authed && page + 3 >= auth0) throw java.io.IOException("NAK")
+                    val p = page * 4
                     ByteArray(16) { k ->
                         val i = p + k
                         if (i in 0x85 * 4 until 0x87 * 4) 0 else mem.getOrElse(i) { 0 }
@@ -77,7 +81,7 @@ class Type2Test {
                         return mem.copyOfRange(0x86 * 4, 0x86 * 4 + 2)
                     }
                     failures++
-                    if (limit != 0 && failures >= limit) frozen = true
+                    if (limit != 0 && failures >= (1 shl limit)) frozen = true
                     nak
                 }
                 else -> nak
@@ -138,7 +142,7 @@ class Type2Test {
         val fake = FakeNtag()
         val t = Type2Tag(fake, fake.uid)
         t.setPassword(NtagModel.NTAG215, "pin", limitAttempts = true, current = null)
-        repeat(Type2Tag.ATTEMPT_LIMIT) { assertFails<WrongPasswordException> { t.authenticate("guess") } }
+        repeat(NtagModel.NTAG215.maxAttempts) { assertFails<WrongPasswordException> { t.authenticate("guess") } }
         assertFails<WrongPasswordException> { t.authenticate("pin") }
     }
 
@@ -190,6 +194,29 @@ class Type2Test {
         fake.reset()
         assertEquals(WriteProtection.Open, t.status(NtagModel.NTAG215))
         assertFails<Type2Exception> { Type2Tag.pwdFor(PasswordScheme.HEX, "FFFF", ByteArray(0)) }
+    }
+
+    @Test
+    fun readsNdefDirectlyAndHandlesReadProtection() {
+        val fake = FakeNtag()
+        val t = Type2Tag(fake, fake.uid)
+        val ndef = t.readNdef()!!
+        assertEquals(0, ndef.message.size)
+        assertEquals(496, ndef.capacity)
+        t.writeNdef(message("direct read"))
+        assertArrayEquals(message("direct read"), t.readNdef()!!.message)
+
+        t.setPassword(NtagModel.NTAG215, "pw", limitAttempts = true, current = null)
+        fake.mem[0x83 * 4 + 4] = (fake.mem[0x83 * 4 + 4].toInt() or 0x80).toByte() // PROT: reading needs the password too
+        fake.reset()
+        assertFails<Exception> { t.readNdef() }
+        assertEquals(WriteProtection.Password(limited = true, readProtected = true), t.status(NtagModel.NTAG215))
+        assertTrue(t.describe().any { it.contains("unreadable") })
+
+        t.factoryReset(NtagModel.NTAG215, "pw")
+        fake.reset()
+        assertEquals(WriteProtection.Open, t.status(NtagModel.NTAG215))
+        assertEquals(0, t.readNdef()!!.message.size)
     }
 
     @Test

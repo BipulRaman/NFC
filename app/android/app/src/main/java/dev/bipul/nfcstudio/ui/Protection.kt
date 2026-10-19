@@ -171,10 +171,15 @@ fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit,
                     )
                     p.status == WriteProtection.Locked -> Text("This card is locked permanently.")
                     p.status is WriteProtection.Password -> {
-                        Text("Changes need the card password. Anyone can still read it.", style = MaterialTheme.typography.bodyMedium)
-                        if ((p.status as WriteProtection.Password).limited) {
+                        val pw = p.status as WriteProtection.Password
+                        Text(
+                            if (pw.readProtected) "Reading and changing this card both need its password."
+                            else "Changes need the card password. Anyone can still read it.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (pw.limited) {
                             Text(
-                                "After ${Type2Tag.ATTEMPT_LIMIT} wrong passwords in a row the card can never be changed again.",
+                                "After ${p.model.maxAttempts} wrong passwords in a row the card can never be changed again.",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
@@ -231,7 +236,7 @@ fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit,
         }
     }
     passwordMode?.let { mode ->
-        CardPasswordDialog(mode, onDismiss = { passwordMode = null }) { current, new, limit ->
+        CardPasswordDialog(mode, attempts = card?.protection?.model?.maxAttempts ?: 8, onDismiss = { passwordMode = null }) { current, new, limit ->
             passwordMode = null
             onDismiss()
             if (current.isNotEmpty()) vm.rememberCardPassword(current)
@@ -279,7 +284,7 @@ fun FullEraseDialog(card: CardSnapshot, onDismiss: () -> Unit, onConfirm: (passw
                     )
                     if ((status as WriteProtection.Password).limited) {
                         Text(
-                            "Careful: this card freezes for good after ${Type2Tag.ATTEMPT_LIMIT} wrong passwords in a row.",
+                            "Careful: this card freezes for good after ${card.protection?.model?.maxAttempts ?: 8} wrong passwords in a row.",
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -341,6 +346,7 @@ fun PasswordField(value: String, onChange: (String) -> Unit, label: String, isEr
 @Composable
 fun CardPasswordDialog(
     mode: PasswordMode,
+    attempts: Int,
     onDismiss: () -> Unit,
     onConfirm: (current: String, new: String, limitAttempts: Boolean) -> Unit,
 ) {
@@ -380,7 +386,7 @@ fun CardPasswordDialog(
                     PasswordField(new2, { new2 = it; error = null }, "Repeat new password")
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = limit, onCheckedChange = { limit = it })
-                        Text("Freeze the card after ${Type2Tag.ATTEMPT_LIMIT} wrong passwords (stops guessing)")
+                        Text("Freeze the card after $attempts wrong passwords (stops guessing)")
                     }
                     Text(
                         "Tags only hold a short password, so keep the freeze on. A forgotten password can't be " +

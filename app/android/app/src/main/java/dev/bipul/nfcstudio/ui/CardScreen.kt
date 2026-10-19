@@ -21,6 +21,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.outlined.DataObject
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
@@ -87,9 +91,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.bipul.nfcstudio.data.CardItem
 import dev.bipul.nfcstudio.data.ItemKind
+import dev.bipul.nfcstudio.data.RawJson
 import dev.bipul.nfcstudio.data.Seal
 import dev.bipul.nfcstudio.data.WifiSecurity
+import dev.bipul.nfcstudio.nfc.CardSnapshot
 import dev.bipul.nfcstudio.nfc.WriteProtection
+import org.json.JSONArray
+import org.json.JSONObject
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -109,6 +117,7 @@ fun CardScreen(
     var confirmLock by remember { mutableStateOf(false) }
     var showProtection by remember { mutableStateOf(false) }
     var confirmFullErase by remember { mutableStateOf(false) }
+    var showRaw by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val fabExpanded by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 } }
@@ -144,6 +153,9 @@ fun CardScreen(
                         }
                         if (card?.canMakeReadOnly == true) {
                             MenuItem("Lock card permanently", Icons.Outlined.Lock) { menu = false; confirmLock = true }
+                        }
+                        if (card != null) {
+                            MenuItem("View raw data (JSON)", Icons.Outlined.DataObject) { menu = false; showRaw = true }
                         }
                         MenuItem("Advanced tools", Icons.Outlined.Build) { menu = false; vm.screen = Screen.TOOLS }
                     }
@@ -252,6 +264,9 @@ fun CardScreen(
             onLock = { confirmLock = true },
             onErase = { confirmFullErase = true },
         )
+    }
+    if (showRaw && card != null) {
+        RawDataDialog(card) { showRaw = false }
     }
     if (confirmFullErase && card != null) {
         FullEraseDialog(card, onDismiss = { confirmFullErase = false }) { password, scheme ->
@@ -537,15 +552,86 @@ private fun ItemCard(
                             }
                         }
                     }
-                    shown is CardItem.Unknown -> Text(
-                        "This app doesn't recognise this data, so it's kept exactly as it is.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    shown is CardItem.Unknown -> {
+                        val json = remember(shown) { RawJson.pretty(RawJson.record(shown.record)) }
+                        Text(
+                            "Unrecognised format, shown as raw data. It's kept exactly as it is when you save.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        JsonBlock(json, maxLines = 14)
+                        Actions { Chip("Copy JSON", Icons.Outlined.ContentCopy) { copy("Raw data", json) } }
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+fun JsonBlock(json: String, maxLines: Int = Int.MAX_VALUE, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(8.dp),
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Text(
+            json,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(10.dp),
+        )
+    }
+}
+
+/** Everything on the card as JSON, for cards or data the app doesn't fully understand. */
+@Composable
+private fun RawDataDialog(card: CardSnapshot, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val json = remember(card) {
+        val info = JSONObject()
+            .put("id", card.idHex)
+            .put("type", card.typeName)
+            .put("technologies", JSONArray(card.techs))
+            .put("capacity", card.capacity ?: JSONObject.NULL)
+            .put("used", card.used)
+            .put("writable", card.writable)
+            .put(
+                "seal",
+                when (val s = card.seal) {
+                    Seal.Status.None -> "none"
+                    is Seal.Status.Valid -> "valid (key ${Seal.fingerprint(s.key)})"
+                    Seal.Status.Broken -> "broken"
+                },
+            )
+            .put(
+                "protection",
+                when (val p = card.protection?.status) {
+                    null, WriteProtection.Open -> "none"
+                    is WriteProtection.Password -> if (p.readProtected) "password (read and write)" else "password (write)"
+                    WriteProtection.Locked -> "locked permanently"
+                },
+            )
+        if (card.notice != null) info.put("note", card.notice)
+        RawJson.pretty(JSONObject().put("card", info).put("records", RawJson.records(card.records)))
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Raw data") },
+        text = {
+            JsonBlock(json, modifier = Modifier.verticalScroll(rememberScrollState()))
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                copyToClipboard(context, "Card data", json, sensitive = true)
+                onDismiss()
+            }) { Text("Copy JSON") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @OptIn(ExperimentalLayoutApi::class)

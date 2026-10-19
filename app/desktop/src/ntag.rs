@@ -43,6 +43,20 @@ impl Model {
             Model::UltralightEv1Large => 0x25,
         }
     }
+
+    fn is_ntag(self) -> bool {
+        matches!(self, Model::Ntag213 | Model::Ntag215 | Model::Ntag216)
+    }
+
+    /// AUTHLIM value for the wrong-password limit: NTAG allows 2^AUTHLIM tries, Ultralight EV1 AUTHLIM.
+    pub fn auth_limit(self) -> u8 {
+        if self.is_ntag() { 3 } else { 7 }
+    }
+
+    /// Wrong passwords in a row before a card configured with [`Model::auth_limit`] freezes.
+    pub fn max_attempts(self) -> u32 {
+        if self.is_ntag() { 8 } else { 7 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +69,6 @@ pub enum Status {
     Locked,
 }
 
-pub const ATTEMPT_LIMIT: u8 = 7;
 const PROTECT_FROM: u8 = 4;
 pub const WRONG_PASSWORD: &str = "Wrong card password.";
 
@@ -138,7 +151,10 @@ fn write(t: &mut impl Raw, page: u8, data: [u8; 4]) -> Result<(), String> {
 
 pub fn status(t: &mut impl Raw, model: Model) -> Result<Status, String> {
     let head = read4(t, 0)?;
-    let cfg = read4(t, model.cfg_page())?;
+    let Ok(cfg) = read4(t, model.cfg_page()) else {
+        // The configuration is only unreadable when reading is password-protected too.
+        return Ok(Status::Password { limited: true });
+    };
     let cc_read_only = head[15] & 0x0F == 0x0F;
     let static_locked = head[10] == 0xFF && head[11] == 0xFF;
     let auth0 = cfg[3];
@@ -195,7 +211,7 @@ pub fn set_password(
     let (pwd, pack) = derive(new_password, uid);
     write(t, model.cfg_page() + 2, pwd)?;
     write(t, model.cfg_page() + 3, [pack[0], pack[1], 0, 0])?;
-    configure(t, model, PROTECT_FROM, if limit_attempts { ATTEMPT_LIMIT } else { 0 })?;
+    configure(t, model, PROTECT_FROM, if limit_attempts { model.auth_limit() } else { 0 })?;
     authenticate(t, new_password, uid).map_err(|_| "The password was set but couldn't be confirmed. Try again.".into())
 }
 
@@ -386,7 +402,7 @@ pub(crate) mod tests {
                         return Ok(self.mem[0x86 * 4..0x86 * 4 + 2].to_vec());
                     }
                     self.failures += 1;
-                    if limit != 0 && self.failures >= limit {
+                    if limit != 0 && self.failures >= 1 << limit {
                         self.frozen = true;
                     }
                     Err("NAK".into())
@@ -449,7 +465,7 @@ pub(crate) mod tests {
         let mut t = FakeNtag::new();
         let uid = t.uid();
         set_password(&mut t, Model::Ntag215, &uid, "pin", true, None).unwrap();
-        for _ in 0..ATTEMPT_LIMIT {
+        for _ in 0..Model::Ntag215.max_attempts() {
             assert!(authenticate(&mut t, "guess", &uid).is_err());
         }
         assert!(authenticate(&mut t, "pin", &uid).is_err(), "frozen even with the right password");

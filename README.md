@@ -92,7 +92,7 @@ Unit tests (codec, encryption and ISO 15693): `gradle testDebugUnitTest` in `app
   (`~/.config/nfc-studio/seal-key` elsewhere).
 - **Write password** (NTAG213/215/216, MIFARE Ultralight EV1): the chip's own password protection. Anyone
   can still read the card, but changes need the password. The password is turned into the chip's 32-bit
-  PWD/PACK with PBKDF2 and the card ID, and the card can freeze itself after 7 wrong attempts to stop
+  PWD/PACK with PBKDF2 and the card ID, and the card can freeze itself after 8 wrong attempts (7 on Ultralight EV1) to stop
   guessing. Passwords are only kept in memory for the session.
 - **Erase completely**: wipes every byte of an NTAG / Ultralight EV1 card and removes its password, so it's like new. Works with passwords set in NFC Studio, NFC Tools (MD5-based) or entered as 8 raw hex digits. A forgotten password or a permanently locked card can't be erased; the chip enforces this.
 - **Lock permanently**: makes the card read-only forever (static lock bits, read-only flag, and a random
@@ -101,6 +101,9 @@ Unit tests (codec, encryption and ISO 15693): `gradle testDebugUnitTest` in `app
 Write protection stops changes, not reading; keep secrets in PIN-protected items. On the desktop, the
 password and lock need a reader that can send raw tag commands (PC/SC transparent session, e.g. OMNIKEY
 5022 or ACR1252U, or an ACR122U); the seal works with any reader.
+
+- **Raw data**: records the app doesn't recognise are shown as raw JSON (type, text or parsed JSON payload, and hex), and the whole card can be viewed and copied as JSON (desktop: **{ } Raw data**; Android: menu ⋮ → **View raw data (JSON)**).
+- **Deep scan** (Android): some phones silently ignore cards whose content check fails, such as read-protected NTAG tags. Turn on deep scan (home screen or Advanced tools) to read such cards directly; read-protected cards can then be erased completely with their password.
 
 ## App icon
 
