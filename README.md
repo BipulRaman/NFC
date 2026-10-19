@@ -102,7 +102,7 @@ Write protection stops changes, not reading; keep secrets in PIN-protected items
 password and lock need a reader that can send raw tag commands (PC/SC transparent session, e.g. OMNIKEY
 5022 or ACR1252U, or an ACR122U); the seal works with any reader.
 
-- **Raw data**: records the app doesn't recognise are shown as raw JSON (type, text or parsed JSON payload, and hex), and the whole card can be viewed and copied as JSON (desktop: **{ } Raw data**; Android: menu ⋮ → **View raw data (JSON)**).
+- **Raw data**: records the app doesn't recognise are shown as raw JSON (type, text or parsed JSON payload, and hex), and the whole card can be viewed and copied as JSON (desktop: **{ } Raw data**; Android: the **{ }** button next to the shield, which shows it as a card).
 - **Deep scan** (Android): some phones silently ignore cards whose content check fails, such as read-protected NTAG tags. Turn on deep scan (home screen or Advanced tools) to read such cards directly; read-protected cards can then be erased completely with their password.
 
 ## App icon
