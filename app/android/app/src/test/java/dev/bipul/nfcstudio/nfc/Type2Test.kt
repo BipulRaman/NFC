@@ -143,6 +143,56 @@ class Type2Test {
     }
 
     @Test
+    fun factoryResetWipesEverythingAndRemovesPassword() {
+        val fake = FakeNtag()
+        val t = Type2Tag(fake, fake.uid)
+        t.writeNdef(message("secret data ".repeat(20)))
+        t.setPassword(NtagModel.NTAG215, "pw", limitAttempts = true, current = null)
+        fake.reset()
+        assertFails<NeedsPasswordException> { t.factoryReset(NtagModel.NTAG215, null) }
+        assertFails<WrongPasswordException> { t.factoryReset(NtagModel.NTAG215, "bad") }
+        t.factoryReset(NtagModel.NTAG215, "pw")
+        fake.reset()
+        assertEquals(WriteProtection.Open, t.status(NtagModel.NTAG215))
+        assertArrayEquals(byteArrayOf(0x03, 0x00, 0xFE.toByte(), 0x00), fake.mem.copyOfRange(16, 20))
+        assertTrue(fake.mem.copyOfRange(20, 130 * 4).all { it == 0.toByte() })
+        t.writeNdef(message("fresh"))
+
+        t.lockForever(NtagModel.NTAG215, null)
+        fake.reset()
+        try {
+            t.factoryReset(NtagModel.NTAG215, null)
+            fail("locked cards can't be erased")
+        } catch (e: Type2Exception) {
+            assertEquals(Type2Tag.LOCKED_FOREVER, e.message)
+        }
+    }
+
+    @Test
+    fun erasesCardsProtectedByOtherApps() {
+        val md5 = Type2Tag.pwdFor(PasswordScheme.NFC_TOOLS, "1234", ByteArray(0)).first
+        assertEquals("81dc9bdb", md5.joinToString("") { "%02x".format(it) })
+        val fake = FakeNtag()
+        val t = Type2Tag(fake, fake.uid)
+        t.writeNdef(message("from another app"))
+        md5.copyInto(fake.mem, 0x85 * 4)
+        fake.mem[0x83 * 4 + 3] = 0x04
+        fake.reset()
+        assertFails<Exception> { t.factoryReset(NtagModel.NTAG215, "1234", PasswordScheme.NFC_STUDIO) }
+        t.factoryReset(NtagModel.NTAG215, "1234", PasswordScheme.NFC_TOOLS)
+        fake.reset()
+        assertEquals(WriteProtection.Open, t.status(NtagModel.NTAG215))
+
+        byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte()).copyInto(fake.mem, 0x85 * 4)
+        fake.mem[0x83 * 4 + 3] = 0x04
+        fake.reset()
+        t.factoryReset(NtagModel.NTAG215, "de:ad:be:ef", PasswordScheme.HEX)
+        fake.reset()
+        assertEquals(WriteProtection.Open, t.status(NtagModel.NTAG215))
+        assertFails<Type2Exception> { Type2Tag.pwdFor(PasswordScheme.HEX, "FFFF", ByteArray(0)) }
+    }
+
+    @Test
     fun lockForeverIsPermanent() {
         val fake = FakeNtag()
         val t = Type2Tag(fake, fake.uid)

@@ -68,6 +68,48 @@ pub fn derive(password: &str, uid: &[u8]) -> ([u8; 4], [u8; 2]) {
     ([out[0], out[1], out[2], out[3]], [out[4], out[5]])
 }
 
+/// How a typed password becomes the chip's 4-byte PWD, depending on which app set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PwScheme {
+    NfcStudio,
+    /// NFC Tools (wakdev) and compatible apps: first 4 bytes of MD5(password).
+    NfcTools,
+    /// The raw PWD as 8 hex digits, e.g. `FFFFFFFF`.
+    Hex,
+}
+
+impl PwScheme {
+    pub const ALL: [PwScheme; 3] = [PwScheme::NfcStudio, PwScheme::NfcTools, PwScheme::Hex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PwScheme::NfcStudio => "NFC Studio",
+            PwScheme::NfcTools => "NFC Tools or a similar app",
+            PwScheme::Hex => "Raw password (8 hex digits)",
+        }
+    }
+}
+
+/// PWD for `password`, plus the PACK the card should answer with when we know it.
+pub fn pwd_for(scheme: PwScheme, password: &str, uid: &[u8]) -> Result<([u8; 4], Option<[u8; 2]>), String> {
+    match scheme {
+        PwScheme::NfcStudio => {
+            let (pwd, pack) = derive(password, uid);
+            Ok((pwd, Some(pack)))
+        }
+        PwScheme::NfcTools => {
+            use md5::{Digest, Md5};
+            let h = Md5::digest(password.as_bytes());
+            Ok(([h[0], h[1], h[2], h[3]], None))
+        }
+        PwScheme::Hex => {
+            let b = crate::apdu::parse_hex(password).ok().filter(|b| b.len() == 4);
+            let b = b.ok_or("Enter exactly 8 hex digits, for example FFFFFFFF.")?;
+            Ok(([b[0], b[1], b[2], b[3]], None))
+        }
+    }
+}
+
 pub fn identify(t: &mut impl Raw) -> Option<Model> {
     let v = t.raw(&[0x60]).ok()?;
     if v.len() < 8 || v[1] != 0x04 {
@@ -112,9 +154,16 @@ pub fn status(t: &mut impl Raw, model: Model) -> Result<Status, String> {
 
 /// Proves the password for this session so protected pages can be written.
 pub fn authenticate(t: &mut impl Raw, password: &str, uid: &[u8]) -> Result<(), String> {
-    let (pwd, pack) = derive(password, uid);
+    authenticate_with(t, PwScheme::NfcStudio, password, uid)
+}
+
+pub fn authenticate_with(t: &mut impl Raw, scheme: PwScheme, password: &str, uid: &[u8]) -> Result<(), String> {
+    let (pwd, pack) = pwd_for(scheme, password, uid)?;
     let r = t.raw(&[0x1B, pwd[0], pwd[1], pwd[2], pwd[3]]).map_err(|_| WRONG_PASSWORD.to_string())?;
-    if r.len() < 2 || r[..2] != pack {
+    if r.len() < 2 {
+        return Err(WRONG_PASSWORD.into());
+    }
+    if pack.is_some_and(|p| r[..2] != p) {
         // A genuine chip answers with the PACK we stored; anything else is suspicious.
         return Err("The card answered the password check incorrectly. It may be counterfeit.".into());
     }
@@ -152,9 +201,53 @@ pub fn set_password(
 
 pub fn remove_password(t: &mut impl Raw, model: Model, uid: &[u8], current: &str) -> Result<(), String> {
     authenticate(t, current, uid)?;
+    clear_password(t, model)
+}
+
+fn clear_password(t: &mut impl Raw, model: Model) -> Result<(), String> {
     configure(t, model, 0xFF, 0)?;
     write(t, model.cfg_page() + 2, [0xFF; 4])?;
     write(t, model.cfg_page() + 3, [0; 4])
+}
+
+pub const LOCKED_FOREVER: &str = "This card is locked permanently, so it can never be erased. \
+     That's what makes the lock tamper-proof.";
+
+/// Last page of user memory; lock and configuration pages follow it.
+fn last_user_page(model: Model) -> u8 {
+    match model {
+        Model::UltralightEv1Small => model.cfg_page() - 1,
+        _ => model.cfg_page() - 2,
+    }
+}
+
+/// Wipes all user memory (leaving an empty NDEF message) and removes the write password.
+/// `current` is needed when the card has a password; `scheme` says which app set it.
+pub fn factory_reset(
+    t: &mut impl Raw,
+    model: Model,
+    uid: &[u8],
+    current: Option<&str>,
+    scheme: PwScheme,
+) -> Result<(), String> {
+    let had_password = match status(t, model)? {
+        Status::Locked => return Err(LOCKED_FOREVER.into()),
+        Status::Password { .. } => {
+            authenticate_with(t, scheme, current.ok_or(WRONG_PASSWORD)?, uid)?;
+            true
+        }
+        Status::Open => false,
+    };
+    // The empty message goes first so the card is valid even if the wipe is interrupted.
+    let wiped = write(t, 4, [0x03, 0x00, 0xFE, 0x00])
+        .and_then(|_| (5..=last_user_page(model)).try_for_each(|p| write(t, p, [0; 4])));
+    if wiped.is_err() {
+        return Err("Part of this card is locked permanently, so it couldn't be fully erased.".into());
+    }
+    if had_password {
+        clear_password(t, model)?;
+    }
+    Ok(())
 }
 
 /// Makes the card read-only forever: static lock bits and the read-only CC flag cover pages 3–15;
@@ -360,6 +453,63 @@ pub(crate) mod tests {
             assert!(authenticate(&mut t, "guess", &uid).is_err());
         }
         assert!(authenticate(&mut t, "pin", &uid).is_err(), "frozen even with the right password");
+    }
+
+    #[test]
+    fn factory_reset_wipes_everything_and_removes_password() {
+        let mut t = FakeNtag::new();
+        let uid = t.uid();
+        write_text(&mut t, &"secret data ".repeat(20)).unwrap();
+        set_password(&mut t, Model::Ntag215, &uid, "pw", true, None).unwrap();
+        t.reset();
+        let studio = PwScheme::NfcStudio;
+        assert_eq!(factory_reset(&mut t, Model::Ntag215, &uid, None, studio).unwrap_err(), WRONG_PASSWORD);
+        assert!(factory_reset(&mut t, Model::Ntag215, &uid, Some("bad"), studio).is_err());
+        factory_reset(&mut t, Model::Ntag215, &uid, Some("pw"), studio).unwrap();
+        t.reset();
+        assert_eq!(status(&mut t, Model::Ntag215).unwrap(), Status::Open);
+        assert_eq!(t.mem[16..20], [0x03, 0x00, 0xFE, 0x00]);
+        assert!(t.mem[20..130 * 4].iter().all(|&b| b == 0), "user memory wiped");
+        match tag::read(&mut RawTransport(&mut t), Tech::Type2).unwrap() {
+            ReadOutcome::Ndef(c) => assert!(c.records.is_empty() && c.writable),
+            other => panic!("{other:?}"),
+        }
+        write_text(&mut t, "fresh").unwrap();
+
+        lock_forever(&mut t, Some(Model::Ntag215), &uid, None).unwrap();
+        t.reset();
+        assert_eq!(factory_reset(&mut t, Model::Ntag215, &uid, None, studio).unwrap_err(), LOCKED_FOREVER);
+        assert_eq!(read_text(&mut t), "fresh");
+    }
+
+    /// Protects the fake card the way NFC Tools does: PWD = MD5(password)[..4], any PACK.
+    fn protect_like_other_app(t: &mut FakeNtag, pwd: [u8; 4]) {
+        let cfg = 0x83 * 4;
+        t.mem[cfg + 8..cfg + 12].copy_from_slice(&pwd);
+        t.mem[cfg + 12..cfg + 14].copy_from_slice(&[0x12, 0x34]);
+        t.mem[cfg + 3] = 0x04;
+        t.reset();
+    }
+
+    #[test]
+    fn erases_cards_protected_by_other_apps() {
+        assert_eq!(pwd_for(PwScheme::NfcTools, "1234", &[]).unwrap().0, [0x81, 0xDC, 0x9B, 0xDB]);
+        assert_eq!(pwd_for(PwScheme::Hex, "ff ff ff ff", &[]).unwrap(), ([0xFF; 4], None));
+        assert!(pwd_for(PwScheme::Hex, "FFFF", &[]).is_err());
+
+        let mut t = FakeNtag::new();
+        let uid = t.uid();
+        write_text(&mut t, "from another app").unwrap();
+        protect_like_other_app(&mut t, [0x81, 0xDC, 0x9B, 0xDB]);
+        assert!(factory_reset(&mut t, Model::Ntag215, &uid, Some("1234"), PwScheme::NfcStudio).is_err());
+        factory_reset(&mut t, Model::Ntag215, &uid, Some("1234"), PwScheme::NfcTools).unwrap();
+        t.reset();
+        assert_eq!(status(&mut t, Model::Ntag215).unwrap(), Status::Open);
+
+        protect_like_other_app(&mut t, [0xDE, 0xAD, 0xBE, 0xEF]);
+        factory_reset(&mut t, Model::Ntag215, &uid, Some("DEADBEEF"), PwScheme::Hex).unwrap();
+        t.reset();
+        assert_eq!(status(&mut t, Model::Ntag215).unwrap(), Status::Open);
     }
 
     #[test]

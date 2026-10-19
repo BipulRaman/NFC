@@ -94,6 +94,7 @@ Unit tests (codec, encryption and ISO 15693): `gradle testDebugUnitTest` in `app
   can still read the card, but changes need the password. The password is turned into the chip's 32-bit
   PWD/PACK with PBKDF2 and the card ID, and the card can freeze itself after 7 wrong attempts to stop
   guessing. Passwords are only kept in memory for the session.
+- **Erase completely**: wipes every byte of an NTAG / Ultralight EV1 card and removes its password, so it's like new. Works with passwords set in NFC Studio, NFC Tools (MD5-based) or entered as 8 raw hex digits. A forgotten password or a permanently locked card can't be erased; the chip enforces this.
 - **Lock permanently**: makes the card read-only forever (static lock bits, read-only flag, and a random
   unknown password with a one-attempt limit for the rest of the memory).
 

@@ -149,6 +149,7 @@ private fun waitingTitle(p: Pending) = when (p) {
     Pending.MakeReadOnly -> "Hold the card to lock it"
     is Pending.SetPassword -> "Hold the card to set its password"
     Pending.RemovePassword -> "Hold the card to remove its password"
+    is Pending.FactoryReset -> "Hold the card to erase it completely"
     Pending.Dump -> "Hold the card to read its memory"
     is Pending.Apdu -> "Hold the smart card"
 }

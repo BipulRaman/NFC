@@ -193,6 +193,8 @@ enum PwMode {
     Change,
     Remove,
     Lock,
+    /// Wipe all memory and remove the password.
+    Erase,
 }
 
 struct PwDialog {
@@ -202,6 +204,7 @@ struct PwDialog {
     new2: String,
     limit: bool,
     understood: bool,
+    scheme: ntag::PwScheme,
     error: Option<String>,
 }
 
@@ -214,6 +217,7 @@ impl PwDialog {
             new2: String::new(),
             limit: true,
             understood: false,
+            scheme: ntag::PwScheme::NfcStudio,
             error: None,
         }
     }
@@ -598,8 +602,11 @@ impl App {
                 return Err("The two passwords don't match.".into());
             }
         }
-        if d.mode == PwMode::Lock && !d.understood {
+        if matches!(d.mode, PwMode::Lock | PwMode::Erase) && !d.understood {
             return Err("Tick the box to confirm you understand this can't be undone.".into());
+        }
+        if d.mode == PwMode::Erase && d.limit && d.current.is_empty() {
+            return Err("Enter the card's current password.".into());
         }
         let App { reader: Some(reader), log, .. } = self else { return Err("No reader".into()) };
         let mut raw = RawLink::open(reader, log).ok_or(NO_RAW)?;
@@ -616,6 +623,10 @@ impl App {
             PwMode::Lock => {
                 ntag::lock_forever(&mut raw, model, &uid, current)?;
                 "The card is now locked permanently."
+            }
+            PwMode::Erase => {
+                ntag::factory_reset(&mut raw, need_model()?, &uid, current, d.scheme)?;
+                "The card is completely erased and has no password. It's like new."
             }
             PwMode::Unlock(_) => unreachable!(),
         };
@@ -1070,6 +1081,7 @@ impl App {
                         }
                         ntag::Status::Locked => {
                             ui.label("🔒 Locked permanently. Nobody can ever change this card.");
+                            ui.add(egui::Label::new(RichText::new(ntag::LOCKED_FOREVER).weak()).wrap());
                         }
                     }
                     ui.horizontal_wrapped(|ui| {
@@ -1102,6 +1114,18 @@ impl App {
                                 self.pw_dialog = Some(d);
                             }
                         }
+                        if p.model.is_some() && p.status != ntag::Status::Locked {
+                            let mut d = PwDialog::new(PwMode::Erase);
+                            // For erasing, `limit` records whether the current password must be entered.
+                            d.limit = has_pw;
+                            if ui
+                                .button("🧹 Erase completely…")
+                                .on_hover_text("Wipe every byte and remove the password, like a new card")
+                                .clicked()
+                            {
+                                self.pw_dialog = Some(d);
+                            }
+                        }
                     });
                 }
             }
@@ -1124,7 +1148,7 @@ impl App {
         let Some(mut d) = self.pw_dialog.take() else { return };
         let needs_current = match d.mode {
             PwMode::Unlock(_) | PwMode::Change | PwMode::Remove => true,
-            PwMode::Lock => d.limit,
+            PwMode::Lock | PwMode::Erase => d.limit,
             PwMode::Set => false,
         };
         let needs_new = matches!(d.mode, PwMode::Set | PwMode::Change);
@@ -1144,6 +1168,12 @@ impl App {
                  it again. Its current content stays readable.",
                 "Lock forever",
             ),
+            PwMode::Erase => (
+                "Erase card completely?",
+                "Every byte of the card's memory is wiped, including any seal, and its password is removed. \
+                 The card ends up empty and unprotected, like new.",
+                "Erase everything",
+            ),
         };
         let (mut submit, mut cancel) = (false, false);
         egui::Window::new(title)
@@ -1159,9 +1189,28 @@ impl App {
                     ui.add(egui::TextEdit::singleline(value).password(true).desired_width(f32::INFINITY))
                 };
                 if needs_current {
-                    let r = field(ui, "Current card password", &mut d.current);
+                    if d.mode == PwMode::Erase {
+                        ui.label("The password was set with:");
+                        for s in ntag::PwScheme::ALL {
+                            ui.radio_value(&mut d.scheme, s, s.label());
+                        }
+                    }
+                    let label = if d.scheme == ntag::PwScheme::Hex && d.mode == PwMode::Erase {
+                        "Password (8 hex digits)"
+                    } else {
+                        "Current card password"
+                    };
+                    let r = field(ui, label, &mut d.current);
                     if !needs_new && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
+                    }
+                    if d.mode == PwMode::Erase
+                        && matches!(self.protection, Some(Protection { status: ntag::Status::Password { limited: true }, .. }))
+                    {
+                        ui.colored_label(
+                            BAD,
+                            "Careful: this card freezes for good after 7 wrong passwords in a row.",
+                        );
                     }
                 }
                 if needs_new {
@@ -1180,7 +1229,7 @@ impl App {
                         .wrap(),
                     );
                 }
-                if d.mode == PwMode::Lock {
+                if matches!(d.mode, PwMode::Lock | PwMode::Erase) {
                     ui.checkbox(&mut d.understood, "I understand this can never be undone");
                 }
                 if let Some(e) = &d.error {

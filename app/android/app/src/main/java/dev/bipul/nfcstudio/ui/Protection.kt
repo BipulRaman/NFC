@@ -15,6 +15,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.GppBad
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Lock
@@ -29,6 +30,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -56,6 +58,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.bipul.nfcstudio.data.Seal
 import dev.bipul.nfcstudio.nfc.CardSnapshot
+import dev.bipul.nfcstudio.nfc.PasswordScheme
 import dev.bipul.nfcstudio.nfc.Type2Tag
 import dev.bipul.nfcstudio.nfc.WriteProtection
 
@@ -122,7 +125,7 @@ enum class PasswordMode { SET, CHANGE, REMOVE }
 /** Everything about protecting a card against changes, copies and tampering. */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit) {
+fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit, onErase: () -> Unit) {
     val card = vm.card
     var passwordMode by remember { mutableStateOf<PasswordMode?>(null) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
@@ -202,6 +205,23 @@ fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit)
                 }
             }
 
+            if (card?.protection?.model != null) {
+                Section(Icons.Outlined.DeleteForever, "Erase completely") {
+                    if (card.protection.status == WriteProtection.Locked) {
+                        Text(Type2Tag.LOCKED_FOREVER, style = MaterialTheme.typography.bodyMedium)
+                    } else {
+                        Text(
+                            "Wipe every byte and remove the password, so the card is like new. Works with passwords " +
+                                "set in NFC Studio, NFC Tools and similar apps.",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        OutlinedButton(onClick = { onDismiss(); onErase() }) {
+                            Text("Erase completely…", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            }
+
             HorizontalDivider()
             Text(
                 "Write protection stops changes but not reading. Keep secrets in PIN-protected items.",
@@ -221,6 +241,67 @@ fun ProtectionSheet(vm: AppViewModel, onDismiss: () -> Unit, onLock: () -> Unit)
             }
         }
     }
+}
+
+/** Confirms wiping a card completely; asks for its password (and which app set it) when protected. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun FullEraseDialog(card: CardSnapshot, onDismiss: () -> Unit, onConfirm: (password: String, scheme: PasswordScheme) -> Unit) {
+    val status = card.protection?.status
+    val needsPassword = status is WriteProtection.Password
+    var password by rememberSaveable { mutableStateOf("") }
+    var scheme by rememberSaveable { mutableStateOf(PasswordScheme.NFC_STUDIO) }
+    var understood by rememberSaveable { mutableStateOf(false) }
+    val ready = understood && (!needsPassword || password.isNotEmpty())
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Outlined.DeleteForever, null) },
+        title = { Text("Erase card completely?") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Every byte of the card's memory is wiped, including any seal" +
+                        (if (needsPassword) ", and its password is removed" else "") +
+                        ". The card ends up empty and unprotected, like new.",
+                )
+                if (needsPassword) {
+                    Text("The password was set with:", style = MaterialTheme.typography.labelLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PasswordScheme.entries.forEach { s ->
+                            FilterChip(selected = scheme == s, onClick = { scheme = s }, label = { Text(s.label) })
+                        }
+                    }
+                    PasswordField(
+                        password,
+                        { password = it },
+                        if (scheme == PasswordScheme.HEX) "Password (8 hex digits)" else "Card password",
+                    )
+                    if ((status as WriteProtection.Password).limited) {
+                        Text(
+                            "Careful: this card freezes for good after ${Type2Tag.ATTEMPT_LIMIT} wrong passwords in a row.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Text(
+                        "If the password is forgotten, the card can't be erased. The chip itself enforces this.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = understood, onCheckedChange = { understood = it })
+                    Text("I understand everything on the card will be lost")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = ready, onClick = { onConfirm(password, scheme) }) {
+                Text("Erase everything", color = if (ready) MaterialTheme.colorScheme.error else Color.Unspecified)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

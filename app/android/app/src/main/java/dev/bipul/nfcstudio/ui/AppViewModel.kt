@@ -24,6 +24,7 @@ import dev.bipul.nfcstudio.nfc.CardException
 import dev.bipul.nfcstudio.nfc.CardIo
 import dev.bipul.nfcstudio.nfc.CardSnapshot
 import dev.bipul.nfcstudio.nfc.NeedsPasswordException
+import dev.bipul.nfcstudio.nfc.PasswordScheme
 import dev.bipul.nfcstudio.nfc.WrongPasswordException
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
@@ -47,6 +48,7 @@ sealed interface Pending {
     data object MakeReadOnly : Pending
     data class SetPassword(val password: String, val limitAttempts: Boolean) : Pending
     data object RemovePassword : Pending
+    data class FactoryReset(val scheme: PasswordScheme) : Pending
     data object Dump : Pending
     data class Apdu(val commands: List<ByteArray>) : Pending
 }
@@ -205,6 +207,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 cardPasswords.remove(idOf(tag))
                 "Card password removed" to CardIo.read(tag)
             }
+            is Pending.FactoryReset -> {
+                CardIo.factoryReset(tag, password, op.scheme)
+                cardPasswords.remove(idOf(tag))
+                "Card erased completely" to CardIo.read(tag)
+            }
             Pending.Dump -> {
                 val lines = CardIo.dump(tag)
                 main.post { log.addAll(lines); log.add("") }
@@ -354,6 +361,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun requestSetPassword(password: String, limitAttempts: Boolean) = arm(Pending.SetPassword(password, limitAttempts))
 
     fun requestRemovePassword() = arm(Pending.RemovePassword)
+
+    fun requestFactoryReset(scheme: PasswordScheme) = arm(Pending.FactoryReset(scheme))
 
     fun requestDump() = arm(Pending.Dump)
 

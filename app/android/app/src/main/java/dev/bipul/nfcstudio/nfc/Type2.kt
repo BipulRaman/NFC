@@ -25,6 +25,17 @@ sealed interface WriteProtection {
     data object Locked : WriteProtection
 }
 
+/** How a typed password becomes the chip's 4-byte PWD, depending on which app set it. */
+enum class PasswordScheme(val label: String) {
+    NFC_STUDIO("NFC Studio"),
+
+    /** NFC Tools (wakdev) and compatible apps: first 4 bytes of MD5(password). */
+    NFC_TOOLS("NFC Tools or a similar app"),
+
+    /** The raw PWD as 8 hex digits, e.g. FFFFFFFF. */
+    HEX("Raw password (8 hex digits)"),
+}
+
 /**
  * Hardware write protection for NTAG213/215/216 and MIFARE Ultralight EV1 (NFC Forum Type 2):
  * a 32-bit write password with an optional wrong-attempt limit, permanent locking, and NDEF writes
@@ -72,11 +83,11 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
         }
     }
 
-    fun authenticate(password: String) {
-        val (pwd, pack) = derive(password, uid)
+    fun authenticate(password: String, scheme: PasswordScheme = PasswordScheme.NFC_STUDIO) {
+        val (pwd, pack) = pwdFor(scheme, password, uid)
         val r = io.transceive(byteArrayOf(0x1B) + pwd)
         if (r.size < 2) throw WrongPasswordException()
-        if (!r.copyOf(2).contentEquals(pack)) {
+        if (pack != null && !r.copyOf(2).contentEquals(pack)) {
             throw Type2Exception("The card answered the password check incorrectly. It may be counterfeit.")
         }
     }
@@ -107,9 +118,40 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
 
     fun removePassword(model: NtagModel, current: String) {
         authenticate(current)
+        clearPassword(model)
+    }
+
+    private fun clearPassword(model: NtagModel) {
         configure(model, 0xFF, 0)
         write(model.cfgPage + 2, ByteArray(4) { 0xFF.toByte() })
         write(model.cfgPage + 3, ByteArray(4))
+    }
+
+    /** Last page of user memory; lock and configuration pages follow it. */
+    private fun lastUserPage(model: NtagModel) =
+        if (model == NtagModel.UL_EV1_SMALL) model.cfgPage - 1 else model.cfgPage - 2
+
+    /**
+     * Wipes all user memory (leaving an empty NDEF message) and removes the write password.
+     * [current] is needed when the card has a password; [scheme] says which app set it.
+     */
+    fun factoryReset(model: NtagModel, current: String?, scheme: PasswordScheme = PasswordScheme.NFC_STUDIO) {
+        val hadPassword = when (status(model)) {
+            WriteProtection.Locked -> throw Type2Exception(LOCKED_FOREVER)
+            is WriteProtection.Password -> {
+                authenticate(current ?: throw NeedsPasswordException(), scheme)
+                true
+            }
+            WriteProtection.Open -> false
+        }
+        try {
+            // The empty message goes first so the card is valid even if the wipe is interrupted.
+            write(4, byteArrayOf(0x03, 0x00, 0xFE.toByte(), 0x00))
+            for (p in 5..lastUserPage(model)) write(p, ByteArray(4))
+        } catch (e: Type2Exception) {
+            throw Type2Exception("Part of this card is locked permanently, so it couldn't be fully erased.")
+        }
+        if (hadPassword) clearPassword(model)
     }
 
     /**
@@ -150,6 +192,22 @@ class Type2Tag(private val io: Transceiver, private val uid: ByteArray) {
     companion object {
         const val ATTEMPT_LIMIT = 7
         private const val PROTECT_FROM = 4
+        const val LOCKED_FOREVER = "This card is locked permanently, so it can never be erased. " +
+            "That's what makes the lock tamper-proof."
+
+        /** PWD for [password], plus the PACK the card should answer with when we know it. */
+        fun pwdFor(scheme: PasswordScheme, password: String, uid: ByteArray): Pair<ByteArray, ByteArray?> = when (scheme) {
+            PasswordScheme.NFC_STUDIO -> derive(password, uid)
+            PasswordScheme.NFC_TOOLS ->
+                java.security.MessageDigest.getInstance("MD5").digest(password.toByteArray(Charsets.UTF_8)).copyOf(4) to null
+            PasswordScheme.HEX -> {
+                val h = password.filter { !it.isWhitespace() && it != ':' && it != '-' }
+                if (h.length != 8 || !h.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+                    throw Type2Exception("Enter exactly 8 hex digits, for example FFFFFFFF.")
+                }
+                ByteArray(4) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() } to null
+            }
+        }
 
         /** Card password → (PWD, PACK); the UID salt makes the same password different on every card. */
         fun derive(password: String, uid: ByteArray): Pair<ByteArray, ByteArray> {

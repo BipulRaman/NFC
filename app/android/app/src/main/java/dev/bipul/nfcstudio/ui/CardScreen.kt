@@ -32,6 +32,7 @@ import androidx.compose.material.icons.outlined.Call
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.CopyAll
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Email
@@ -107,6 +108,7 @@ fun CardScreen(
     var confirmErase by remember { mutableStateOf(false) }
     var confirmLock by remember { mutableStateOf(false) }
     var showProtection by remember { mutableStateOf(false) }
+    var confirmFullErase by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val fabExpanded by remember { derivedStateOf { listState.firstVisibleItemIndex == 0 } }
@@ -136,6 +138,9 @@ fun CardScreen(
                         }
                         if (card != null && card.supported && card.writable && !card.blank) {
                             MenuItem("Erase card", Icons.Outlined.DeleteSweep) { menu = false; confirmErase = true }
+                        }
+                        if (card?.protection?.model != null && card.protection.status != WriteProtection.Locked) {
+                            MenuItem("Erase completely…", Icons.Outlined.DeleteForever) { menu = false; confirmFullErase = true }
                         }
                         if (card?.canMakeReadOnly == true) {
                             MenuItem("Lock card permanently", Icons.Outlined.Lock) { menu = false; confirmLock = true }
@@ -241,7 +246,19 @@ fun CardScreen(
         )
     }
     if (showProtection) {
-        ProtectionSheet(vm, onDismiss = { showProtection = false }, onLock = { confirmLock = true })
+        ProtectionSheet(
+            vm,
+            onDismiss = { showProtection = false },
+            onLock = { confirmLock = true },
+            onErase = { confirmFullErase = true },
+        )
+    }
+    if (confirmFullErase && card != null) {
+        FullEraseDialog(card, onDismiss = { confirmFullErase = false }) { password, scheme ->
+            confirmFullErase = false
+            if (password.isNotEmpty()) vm.rememberCardPassword(password)
+            vm.requestFactoryReset(scheme)
+        }
     }
     if (confirmLock) {
         var understood by rememberSaveable { mutableStateOf(false) }

@@ -232,6 +232,15 @@ object CardIo {
         }
     }
 
+    /** Wipes the whole card and removes its write password; [scheme] says which app set the password. */
+    fun factoryReset(tag: Tag, current: String?, scheme: PasswordScheme) = guard {
+        withType2(tag) { t ->
+            val model = t.identify()
+                ?: throw CardException("Erasing completely works with NTAG213/215/216 and MIFARE Ultralight EV1 tags.")
+            t.factoryReset(model, current, scheme)
+        }
+    }
+
     private fun messageFor(records: List<RawRecord>) = if (records.isEmpty()) {
         NdefMessage(NdefRecord(NdefRecord.TNF_EMPTY, null, null, null))
     } else {
